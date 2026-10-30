@@ -2,6 +2,7 @@
 <inkscape-extension xmlns="http://www.inkscape.org/namespace/inkscape/extension">
     <name>Vector Stained Glass</name>
     <id>com.example.inkscapevectorstainedglass</id>
+    <label>Select a bitmap image on the canvas first, then apply.</label>
     <param name="cell_shape" type="optiongroup" appearance="combo"
        gui-text="Cell shape:">
         <option value="voronoi">Voronoi (cracked glass)</option>
