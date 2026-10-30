@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<inkscape-extension xmlns="http://www.inkscape.org/namespace/inkscape/extension">
+    <name>Vector Stained Glass</name>
+    <id>com.example.inkscapevectorstainedglass</id>
+    <param name="cell_shape" type="optiongroup" appearance="combo"
+       gui-text="Cell shape:">
+        <option value="voronoi">Voronoi (cracked glass)</option>
+        <option value="triangles">Triangles (Delaunay)</option>
+    </param>
+    <param name="n_colors" type="int" min="4" max="32" gui-text="Palette colors">12</param>
+    <param name="n_seeds" type="int" min="50" max="3000" gui-text="Number of seeds">600</param>
+    <param name="stroke_width" type="float" min="0.5" max="10" gui-text="Lead line width">2.0</param>
+    <param name="seed_from_edges" type="bool" gui-text="Bias seeds toward image edges">false</param>
+    <param name="random_seed" type="int" gui-text="Random seed" min="1" max="2147483647">42</param>
+    <param name="max_dim" type="int"
+       min="16" max="1080"
+       gui-text="Processing resolution (px)">300</param>
+    <effect>
+        <object-type>all</object-type>
+        <effects-menu>
+            <submenu name="Render"/>
+        </effects-menu>
+    </effect>
+    <script>
+        <command location="inx" interpreter="python">inkscape_vector_stained_glass.py</command>
+    </script>
+</inkscape-extension>
