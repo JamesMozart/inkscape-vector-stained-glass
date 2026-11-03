@@ -23,8 +23,7 @@ cell is filled with its dominant palette color, with dark strokes between cells.
 
 ## Install
 
-1. Copy `inkscape_vector_stained_glass.py` and `inkscape_vector_stained_glass.inx`
-   into your Inkscape extensions directory:
+1. Copy all files into your Inkscape extensions directory:
    - Linux: `~/.config/inkscape/extensions/`
    - macOS: `~/Library/Application Support/org.inkscape.Inkscape/config/inkscape/extensions/`
    - Windows: `%APPDATA%\inkscape\extensions\`
