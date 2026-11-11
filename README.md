@@ -5,12 +5,16 @@ color-quantized, subdivided into cells (Voronoi or Delaunay triangles), and each
 cell is filled with its dominant palette color, with dark strokes between cells.
 
 ![Example output](example.png)
+**Slash Dimension (knife cut)**
+![Example output](example_slash.png)
+
 
 ## Features
 
 - Two cell shapes:
   - `voronoi` — organic polygonal cells from Poisson-disk / edge-weighted seeds
   - `triangles` — Delaunay-based triangular cells
+  - `knife_cut` — Slash Dimension like effect.
 - Color quantization via PIL (LibImageQuant)
 - Optional edge-aware seed placement
 - Pure numpy Delaunay (Bowyer-Watson), no scipy dependency
@@ -23,7 +27,8 @@ cell is filled with its dominant palette color, with dark strokes between cells.
 
 ## Install
 
-1. Copy all files into your Inkscape extensions directory:
+1. Copy `inkscape_vector_stained_glass.py` and `inkscape_vector_stained_glass.inx`
+   into your Inkscape extensions directory:
    - Linux: `~/.config/inkscape/extensions/`
    - macOS: `~/Library/Application Support/org.inkscape.Inkscape/config/inkscape/extensions/`
    - Windows: `%APPDATA%\inkscape\extensions\`
@@ -41,11 +46,11 @@ The result is added as a group named `Vector Stained Glass`.
 
 | Option            | Type    | Default    | Description                                                        |
 | ----------------- | ------- | ---------- | ------------------------------------------------------------------ |
-| `cell_shape`      | choice  | `voronoi`  | Cell shape: `voronoi` (organic polygons) or `triangles` (Delaunay).|
+| `cell_shape`      | choice  | `voronoi`  | Cell shape: `voronoi` (organic polygons) or `triangles` (Delaunay), or `knife_cut` (sparse perpendicular-bisector cuts between nearest same-color region centroids).|
 | `n_colors`        | int     | `12`       | Palette size for color quantization.                               |
 | `n_seeds`         | int     | `600`      | Number of cells (seeds / target triangles).                        |
 | `stroke_width`    | float   | `2.0`      | Outline stroke width between cells.                                |
-| `seed_from_edges` | bool    | `False`    | Bias seed placement toward image edges (Voronoi only).             |
+| `seed_from_edges` | bool    | `False`    | Bias seed placement toward image edges.             |
 | `random_seed`     | int     | `42`       | RNG seed for reproducible results.                                 |
 | `max_dim`         | int     | `600`      | Max dimension of the downscaled copy used for processing.          |
 

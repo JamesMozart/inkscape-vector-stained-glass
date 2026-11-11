@@ -7,9 +7,10 @@
        gui-text="Cell shape:">
         <option value="voronoi">Voronoi (cracked glass)</option>
         <option value="triangles">Triangles (Delaunay)</option>
+        <option value="knife_cut">Knife cut</option>
     </param>
     <param name="n_colors" type="int" min="4" max="32" gui-text="Palette colors">12</param>
-    <param name="n_seeds" type="int" min="50" max="3000" gui-text="Number of seeds">600</param>
+    <param name="n_seeds" type="int" min="4" max="3000" gui-text="Number of seeds">600</param>
     <param name="stroke_width" type="float" min="0.5" max="10" gui-text="Lead line width">2.0</param>
     <param name="seed_from_edges" type="bool" gui-text="Bias seeds toward image edges">false</param>
     <param name="random_seed" type="int" gui-text="Random seed" min="1" max="2147483647">42</param>
