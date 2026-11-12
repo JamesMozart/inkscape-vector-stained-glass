@@ -13,33 +13,43 @@ from inkex.units import convert_unit
 
 def clip_polygon_halfplane(poly, a, b, c):
     """Clip a convex polygon against a*x + b*y + c <= 0 (Sutherland-Hodgman)."""
-    if not poly:
-        return []
+    poly = np.asarray(poly, dtype=float)
+    n = len(poly)
+    if n == 0:
+        return np.empty((0, 2), dtype=float)
+
+    ab = np.array([a, b], dtype=float)
+    dist = poly @ ab + c
+    inside = dist <= 1e-9
+    # skip fully inside or outside
+    inside_size = inside.sum()
+    if inside_size == n:
+        return poly
+    elif inside_size == 0:
+        return np.empty((0, 2), dtype=float)
+    prev_inside = np.roll(inside, 1)
 
     def intersect(p1, p2):
-        d1 = a * p1[0] + b * p1[1] + c
-        d2 = a * p2[0] + b * p2[1] + c
+        d1 = p1 @ ab + c
+        d2 = p2 @ ab + c
         denom = d1 - d2
         if abs(denom) < 1e-12:
             return p1
         t = d1 / denom
-        return (p1[0] + t * (p2[0] - p1[0]), p1[1] + t * (p2[1] - p1[1]))
+        return p1 + t * (p2 - p1)
 
     out = []
-    n = len(poly)
     prev = poly[-1]
-    prev_in = a * prev[0] + b * prev[1] + c <= 1e-9
     for i in range(n):
         cur = poly[i]
-        cur_in = a * cur[0] + b * cur[1] + c <= 1e-9
-        if cur_in:
-            if not prev_in:
+        if inside[i]:
+            if not prev_inside[i]:
                 out.append(intersect(prev, cur))
             out.append(cur)
-        elif prev_in:
+        elif prev_inside[i]:
             out.append(intersect(prev, cur))
-        prev, prev_in = cur, cur_in
-    return out
+        prev = cur
+    return np.asarray(out, dtype=float) if out else np.empty((0, 2), dtype=float)
 
 
 def clip_polygon_rect(poly, w, h):
@@ -82,15 +92,21 @@ def voronoi_cell(i, seeds, rect_w, rect_h, neighbors_idx=None):
 
 def simplify_poly(poly, eps=0.05):
     """Remove near-duplicate consecutive vertices from a polygon."""
-    if not poly or len(poly) < 3:
+    if len(poly) < 3:
         return poly
-    out = [poly[0]]
-    for p in poly[1:]:
-        if abs(p[0] - out[-1][0]) + abs(p[1] - out[-1][1]) > eps:
-            out.append(p)
-    if len(out) > 1 and abs(out[0][0] - out[-1][0]) + abs(out[0][1] - out[-1][1]) <= eps:
-        out.pop()
-    return out
+    poly_diff = np.maximum(
+        np.abs(np.roll(poly, -1) - poly).sum(axis=1),
+        np.abs(np.roll(poly, 1) - poly).sum(axis=1)
+    )
+    idx = np.flatnonzero(poly_diff > eps)
+    return poly[idx]
+    # idx = [0]
+    # for i, p in enumerate(poly[1:], start=1):
+    #     if np.linalg.norm(p - poly[idx[-1]], ord=1) > eps:
+    #         idx.append(i)
+    # if len(idx) > 1 and np.linalg.norm(poly[0] - poly[idx[-1]]) <= eps:
+    #     idx.pop()
+    # return poly[idx]
 
 
 # ---------- Bowyer-Watson Delaunay triangulation (numpy only) ----------
@@ -603,17 +619,17 @@ def _same_color_components(pal_indices, bridge_radius=0):
     edge_list.append(np.stack([dl[same_dl], dl[same_dl] + w - 1], axis=1))
 
     # ---------- 2. Bridge edges for gaps up to r pixels ----------
-    if r > 0:
+    if r > 1:
         flat2d = flat.reshape(h, w)
         bridge_chunks = []
-        for dy in range(-r, r + 1):
+        for dy in range(0, r + 1):
             for dx in range(-r, r + 1):
                 if dy == 0 and dx == 0:
                     continue
                 # shell of the Chebyshev ball of radius r
                 if max(abs(dy), abs(dx)) != r:
                     continue
-                if dy < 0 or (dy == 0 and dx < 0):
+                if dy == 0 and dx < 0:
                     continue
 
                 y0, y1 = max(0, -dy), min(h, h - dy)
@@ -677,22 +693,11 @@ def _same_color_components(pal_indices, bridge_radius=0):
             break
 
     # ---------- 4. Remap + stats ----------
-    roots, labels_flat = np.unique(parent, return_inverse=True)
+    roots, labels_flat, area = np.unique(parent, return_inverse=True, return_counts=True)
     labels = labels_flat.reshape(h, w).astype(np.int32)
-    n_comp = len(roots)
+    comp_pal = flat[roots]
 
-    area = np.bincount(labels_flat, minlength=n_comp).astype(np.float64)
-
-    order = np.argsort(labels_flat, kind="stable")
-    sorted_labels = labels_flat[order]
-    uniq, first_pos = np.unique(sorted_labels, return_index=True)
-    comp_pal = np.full(n_comp, -1, dtype=np.int64)
-    comp_pal[uniq] = flat[order[first_pos]]
-
-    comp_info = [
-        (int(comp_pal[i]), int(area[i]))
-        for i in range(n_comp)
-    ]
+    comp_info = np.column_stack([comp_pal, area])
     return labels, comp_info
 
 
@@ -880,11 +885,12 @@ def _select_centroids_by_area_with_quota(comp_pal, comp_ids, comp_info,
     return sorted(selected)
 
 
-def knife_cut_cells(img_small, pal_indices, w, h, n_seeds, rng,
-                    seed_from_edges=False, min_area=20.0, bridge_ratio=0.01,
+def knife_cut_cells(img_small, pal_indices, n_palette, w, h, n_seeds, rng,
+                    seed_from_edges=False, bridge_ratio=0.01,
                     edge_weight=0.5, edge_bonus=0.5):
     # Step 1: same-color connected components
     bridge_r = int(round(max(w, h) * bridge_ratio))
+    min_area = w * h // (n_seeds * n_palette)
     labels, comp_info = _same_color_components(
         pal_indices, bridge_radius=bridge_r
     )
@@ -1078,7 +1084,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
             )
         elif cell_shape == "knife_cut":
             polygons = knife_cut_cells(
-                img_small, pal_indices, w, h, n_seeds, rng,
+                img_small, pal_indices, n_palette, w, h, n_seeds, rng,
                 seed_from_edges=self.options.seed_from_edges,
             )
             if not polygons:
