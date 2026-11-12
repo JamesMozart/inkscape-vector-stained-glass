@@ -1046,11 +1046,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         except Exception as e:
             inkex.errormsg(f"Cannot read image: {e}")
             return
-
-        blur_size = max(0, self.options.blur_size)
-        if blur_size > 0:
-            img = img.filter(ImageFilter.MedianFilter(size=blur_size))
-        
+       
         orig_w, orig_h = img.size
         max_dim = self.options.max_dim
         if max(orig_w, orig_h) > max_dim:
@@ -1060,7 +1056,11 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         else:
             w, h = orig_w, orig_h
             img_small = img
-        img_small = img_small.filter(ImageFilter.MedianFilter(size=3))
+
+        blur_size = max(0, self.options.blur_size)
+        if blur_size > 0:
+            blur_size = int(blur_size) // 2 * 2 + 1
+            img = img.filter(ImageFilter.MedianFilter(size=blur_size))
 
         if w < 1 or h < 1:
             inkex.errormsg("Image is too small.")
