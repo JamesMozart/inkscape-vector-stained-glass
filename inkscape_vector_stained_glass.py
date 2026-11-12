@@ -4,7 +4,7 @@ import numpy as np
 import io
 import base64
 import os
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from inkex.units import convert_unit
 
@@ -890,7 +890,7 @@ def knife_cut_cells(img_small, pal_indices, n_palette, w, h, n_seeds, rng,
                     edge_weight=0.5, edge_bonus=0.5):
     # Step 1: same-color connected components
     bridge_r = int(round(max(w, h) * bridge_ratio))
-    min_area = w * h // (n_seeds * n_palette)
+    min_area = w * h / (n_seeds * n_palette)
     labels, comp_info = _same_color_components(
         pal_indices, bridge_radius=bridge_r
     )
@@ -985,6 +985,10 @@ def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
 class VectorStainedGlassExtension(inkex.EffectExtension):
     def add_arguments(self, pars):
         pars.add_argument(
+            "--blur_size", type=int, default=0,
+            help="Blur size applied before segmentation; 0 disables blur",
+        )
+        pars.add_argument(
             "--cell_shape", type=str, default="voronoi",
             choices=["voronoi", "triangles", "knife_cut"],
             help="Cell shape: voronoi (default) or triangles (Delaunay-based) or knife_cut",
@@ -1043,6 +1047,10 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
             inkex.errormsg(f"Cannot read image: {e}")
             return
 
+        blur_size = max(0, self.options.blur_size)
+        if blur_size > 0:
+            img = img.filter(ImageFilter.MedianFilter(size=blur_size))
+        
         orig_w, orig_h = img.size
         max_dim = self.options.max_dim
         if max(orig_w, orig_h) > max_dim:
@@ -1052,6 +1060,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         else:
             w, h = orig_w, orig_h
             img_small = img
+        img_small = img_small.filter(ImageFilter.MedianFilter(size=3))
 
         if w < 1 or h < 1:
             inkex.errormsg("Image is too small.")
