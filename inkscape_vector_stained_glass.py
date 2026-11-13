@@ -8,6 +8,8 @@ from PIL import Image, ImageFilter
 
 from inkex.units import convert_unit
 
+from image_helper import pil_quantize_indices, same_color_components, component_representative_points_dt
+
 
 # ---------- Geometry helpers ----------
 
@@ -100,13 +102,6 @@ def simplify_poly(poly, eps=0.05):
     )
     idx = np.flatnonzero(poly_diff > eps)
     return poly[idx]
-    # idx = [0]
-    # for i, p in enumerate(poly[1:], start=1):
-    #     if np.linalg.norm(p - poly[idx[-1]], ord=1) > eps:
-    #         idx.append(i)
-    # if len(idx) > 1 and np.linalg.norm(poly[0] - poly[idx[-1]]) <= eps:
-    #     idx.pop()
-    # return poly[idx]
 
 
 # ---------- Bowyer-Watson Delaunay triangulation (numpy only) ----------
@@ -449,31 +444,6 @@ def _component_edge_energy(comp_info, labels, edge_map):
     return out
 
 
-# ---------- Color quantization (PIL, index space) ----------
-
-def pil_quantize_indices(img_small, k):
-    """PIL quantization, returning (indices_hw, palette_Kx3)."""
-    q = img_small.quantize(
-        colors=max(2, int(k)),
-        method=Image.Quantize.LIBIMAGEQUANT,
-        dither=Image.Dither.NONE,
-    )
-    indices = np.array(q, dtype=np.int32)
-
-    colors = q.getcolors(maxcolors=256) or []
-    if colors:
-        max_idx = max(i for _, i in colors)
-        n_actual = max_idx + 1
-    else:
-        n_actual = 1
-    pal_flat = q.getpalette() or []
-    palette = np.array(pal_flat[: n_actual * 3], dtype=np.uint8).reshape(-1, 3)
-
-    if indices.size and indices.max() >= n_actual:
-        indices = np.clip(indices, 0, n_actual - 1)
-    return indices, palette
-
-
 # ---------- Rasterization of all Voronoi regions at once ----------
 
 def voronoi_region_labels(seeds, w, h):
@@ -504,68 +474,161 @@ def dominant_palette_index(region_labels, pal_indices, n_cells, n_palette):
 
 
 # ---------- knife cut ----------
-def _pair_edge_score(pts, i, j, edge_map):
-    """Average edge strength sampled at both endpoints of pair (i, j)."""
-    if edge_map is None:
-        return 0.0
-    h, w = edge_map.shape
-    xi = int(np.clip(pts[i][0], 0, w - 1))
-    yi = int(np.clip(pts[i][1], 0, h - 1))
-    xj = int(np.clip(pts[j][0], 0, w - 1))
-    yj = int(np.clip(pts[j][1], 0, h - 1))
-    return 0.5 * (edge_map[yi, xi] + edge_map[yj, xj])
+def _min_enclosing_circle(points, rng=None):
+    """Welzl's randomized incremental MEC. Returns (cx, cy, r)."""
+    P = np.asarray(points, dtype=np.float64)
+    if len(P) == 0:
+        return 0.0, 0.0, 0.0
+    if rng is None:
+        rng = np.random.default_rng(0)
+    P = P[rng.permutation(len(P))]
 
+    def circle_from2(a, b):
+        cx = 0.5 * (a[0] + b[0]); cy = 0.5 * (a[1] + b[1])
+        r = 0.5 * np.hypot(a[0] - b[0], a[1] - b[1])
+        return cx, cy, r
 
-def centroid_cut_sparse(centroids, w, h, rng, edge_map=None):
-    """Each centroid only cuts against its single nearest neighbor.
+    def circle_from3(a, b, c):
+        ax, ay = a; bx, by = b; cx_, cy_ = c
+        d = 2.0 * (ax * (by - cy_) + bx * (cy_ - ay) + cx_ * (ay - by))
+        if abs(d) < 1e-12:
+            # collinear: fall back to the largest pair
+            cands = [circle_from2(a, b), circle_from2(b, c), circle_from2(a, c)]
+            return max(cands, key=lambda t: t[2])
+        ux = ((ax*ax + ay*ay)*(by - cy_) + (bx*bx + by*by)*(cy_ - ay)
+              + (cx_*cx_ + cy_*cy_)*(ay - by)) / d
+        uy = ((ax*ax + ay*ay)*(cx_ - bx) + (bx*bx + by*by)*(ax - cx_)
+              + (cx_*cx_ + cy_*cy_)*(bx - ax)) / d
+        r = np.hypot(ax - ux, ay - uy)
+        return ux, uy, r
 
-    If edge_map is provided, the (random) subset of pairs is chosen with a
-    bias toward pairs whose endpoints sit on strong image edges, so cuts
-    tend to follow visual structure.
+    def contains(c, p, eps=1e-7):
+        cx, cy, r = c
+        return (p[0]-cx)**2 + (p[1]-cy)**2 <= r*r + eps
+
+    c = (P[0][0], P[0][1], 0.0)
+    for i in range(1, len(P)):
+        if contains(c, P[i]):
+            continue
+        c = (P[i][0], P[i][1], 0.0)
+        for j in range(i):
+            if contains(c, P[j]):
+                continue
+            c = circle_from2(P[i], P[j])
+            for k in range(j):
+                if contains(c, P[k]):
+                    continue
+                c = circle_from3(P[i], P[j], P[k])
+    return c
+
+def _boundary_points_of_mask(mask, max_pts=200):
+    """Extract boundary pixels of a binary mask, downsample to max_pts."""
+    # 边界 = mask 内、8 邻域有外点的像素
+    m = mask.astype(np.uint8)
+    er = m.copy()
+    # 4-neighbour erosion
+    er[1:, :] &= m[:-1, :]
+    er[:-1, :] &= m[1:, :]
+    er[:, 1:] &= m[:, :-1]
+    er[:, :-1] &= m[:, 1:]
+    boundary = (m == 1) & (er == 0)
+    ys, xs = np.nonzero(boundary)
+    if len(xs) == 0:
+        return None
+    if len(xs) > max_pts:
+        idx = np.linspace(0, len(xs) - 1, max_pts).astype(int)
+        xs, ys = xs[idx], ys[idx]
+    return np.stack([xs, ys], axis=1).astype(np.float64)
+
+def _circle_contact_triangle(mask, rng=None, max_samples=400):
+    """Compute MEC of the mask's boundary, then pick 3 well-spread contact
+    points (projected onto the circle). Returns (tri_pts, area, circle).
     """
-    pts = np.asarray(centroids, dtype=np.float64)
-    n = len(pts)
-    if n < 2:
-        return [[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]]
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 3:
+        return None, 0.0, None
+    boundary = _boundary_points_of_mask(mask, max_pts=max_samples)
+    if boundary is None or len(boundary) < 3:
+        boundary = np.stack([xs, ys], axis=1).astype(np.float64)
 
-    # Find nearest neighbor for each centroid
-    d = ((pts[:, None, :] - pts[None, :, :]) ** 2).sum(axis=2)
-    np.fill_diagonal(d, np.inf)
-    nn = d.argmin(axis=1)
+    cx, cy, r = _min_enclosing_circle(boundary, rng=rng)
+    if r <= 1e-9:
+        return None, 0.0, None
 
-    # Deduplicate undirected pairs (i, nn[i])
-    pairs = set()
-    for i in range(n):
-        j = int(nn[i])
-        pairs.add((min(i, j), max(i, j)))
-    pairs = np.array(list(pairs))
+    angles = np.arctan2(boundary[:, 1] - cy, boundary[:, 0] - cx)
+    dists = np.hypot(boundary[:, 0] - cx, boundary[:, 1] - cy)
 
-    # Choose n//2 pairs. With an edge map, bias selection by edge strength.
-    k = max(1, n // 2)
-    if len(pairs) > k:
-        if edge_map is not None:
-            scores = np.array(
-                [_pair_edge_score(pts, i, j, edge_map) for (i, j) in pairs],
-                dtype=np.float64,
-            )
-            # Convert scores to sampling weights; add a small floor so that
-            # non-edge pairs still have a chance (keeps coverage reasonable).
-            weights = scores + 0.05
-            weights /= weights.sum()
-            pairs = rng.choice(pairs, size=k, replace=False, p=weights)
-        else:
-            pairs = rng.choice(pairs, size=k, replace=False)
+    order = np.argsort(dists)[::-1]
+    n_cand = min(len(order), 24)
+    cand_angles = angles[order[:n_cand]]
 
-    # Start with full rectangle, cut by each pair's bisector
-    cells = [[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]]
-    for (i, j) in pairs:
-        xi, yi = pts[i]
-        xj, yj = pts[j]
-        a = 2.0 * (xj - xi)
-        b = 2.0 * (yj - yi)
-        c = (xi * xi + yi * yi) - (xj * xj + yj * yj)
+    m = len(cand_angles)
+    if m < 3:
+        best = np.array([0.0, 2 * np.pi / 3, 4 * np.pi / 3])
+    else:
+        idx = np.array([(a, b, c)
+                        for a in np.arange(m)
+                        for b in np.arange(a + 1, m)
+                        for c in np.arange(b + 1, m)])
+        a_idx, b_idx, c_idx = idx[:, 0], idx[:, 1], idx[:, 2]
+
+        ang = np.sort(np.stack([cand_angles[a_idx],
+                                cand_angles[b_idx],
+                                cand_angles[c_idx]], axis=1), axis=1)  # (N,3)
+
+        gaps = np.diff(np.concatenate([ang, ang[:, :1] + 2 * np.pi], axis=1), axis=1)  # (N,3)
+        min_gap = gaps.min(axis=1)                  # (N,)
+
+        best_i = int(np.argmax(min_gap))
+        best = ang[best_i]
+
+    pt3 = np.stack([cx + r * np.cos(best), cy + r * np.sin(best)], axis=1)
+
+    p = pt3
+    area = 0.5 * abs((p[1, 0] - p[0, 0]) * (p[2, 1] - p[0, 1])
+                     - (p[2, 0] - p[0, 0]) * (p[1, 1] - p[0, 1]))
+    return pt3, area, (cx, cy, r)
+
+def _triangle_edges(tri):
+    """Return the three edge lines of a triangle as (a, b, c) with a*x+b*y+c=0.
+
+    Each line is normalized so that (a, b) is a unit normal. The returned
+    tuple also includes the midpoint of the edge (useful as a fallback seed).
+    """
+    tri = np.asarray(tri, dtype=float)          # (3, 2)
+    p1 = tri                                    # (3, 2) 起点
+    p2 = np.roll(tri, -1, axis=0)               # (3, 2) 终点 (i+1)%3
+
+    x1, y1 = p1[:, 0], p1[:, 1]
+    x2, y2 = p2[:, 0], p2[:, 1]
+
+    # Line: a*x + b*y + c = 0
+    a = y2 - y1
+    b = x1 - x2
+    c = x2 * y1 - x1 * y2
+
+    norm = np.hypot(a, b)
+    valid = norm >= 1e-12
+
+    a = a[valid] / norm[valid]
+    b = b[valid] / norm[valid]
+    c = c[valid] / norm[valid]
+
+    return a, b, c
+
+
+def _cut_cells_by_lines(cells, lines, n_seeds):
+    """Split every cell by each line in `lines` (list of (a,b,c)).
+
+    For each line, every existing cell is split into the two half-planes.
+    Empty/degenerate pieces are dropped.
+    """
+    out = cells
+    for (a, b, c, area) in lines:
+        if len(out) >= n_seeds:
+            break
         new_cells = []
-        for poly in cells:
+        for poly in out:
             left = clip_polygon_halfplane(poly, a, b, c)
             right = clip_polygon_halfplane(poly, -a, -b, -c)
             left = simplify_poly(left)
@@ -574,328 +637,91 @@ def centroid_cut_sparse(centroids, w, h, rng, edge_map=None):
                 new_cells.append(left)
             if len(right) >= 3:
                 new_cells.append(right)
-        cells = new_cells
-    return cells
-
-
-def _same_color_components(pal_indices, bridge_radius=0):
-    """Label connected components of equal palette index, numpy-only.
-
-    bridge_radius : int, in pixels (>=0). Pixels of the same palette index
-        whose Chebyshev distance is <= bridge_radius are considered connected,
-        i.e. gaps smaller than bridge_radius between same-color blobs are
-        bridged. bridge_radius=0 reproduces strict 8-connectivity.
-
-    Returns
-    -------
-    labels : (h, w) int32
-    comp_info : list of (pal_idx, area)
-    """
-    h, w = pal_indices.shape
-    flat = pal_indices.ravel().astype(np.int64)
-    n = flat.size
-    r = int(max(0, bridge_radius))
-
-    edge_list = []
-
-    # ---------- 1. Strict 8-neighborhood edges (always) ----------
-    rows = np.arange(h, dtype=np.int64)
-    cols = np.arange(w, dtype=np.int64)
-
-    left = (rows[:, None] * w + cols[None, :w - 1]).ravel()
-    same_h = flat[left] == flat[left + 1]
-    edge_list.append(np.stack([left[same_h], left[same_h] + 1], axis=1))
-
-    top = (rows[:h - 1, None] * w + cols[None, :]).ravel()
-    same_v = flat[top] == flat[top + w]
-    edge_list.append(np.stack([top[same_v], top[same_v] + w], axis=1))
-
-    dr = (rows[:h - 1, None] * w + cols[None, :w - 1]).ravel()
-    same_dr = flat[dr] == flat[dr + w + 1]
-    edge_list.append(np.stack([dr[same_dr], dr[same_dr] + w + 1], axis=1))
-
-    dl = (rows[:h - 1, None] * w + cols[None, 1:]).ravel()
-    same_dl = flat[dl] == flat[dl + w - 1]
-    edge_list.append(np.stack([dl[same_dl], dl[same_dl] + w - 1], axis=1))
-
-    # ---------- 2. Bridge edges for gaps up to r pixels ----------
-    if r > 1:
-        flat2d = flat.reshape(h, w)
-        bridge_chunks = []
-        for dy in range(0, r + 1):
-            for dx in range(-r, r + 1):
-                if dy == 0 and dx == 0:
-                    continue
-                # shell of the Chebyshev ball of radius r
-                if max(abs(dy), abs(dx)) != r:
-                    continue
-                if dy == 0 and dx < 0:
-                    continue
-
-                y0, y1 = max(0, -dy), min(h, h - dy)
-                x0, x1 = max(0, -dx), min(w, w - dx)
-                if y1 <= y0 or x1 <= x0:
-                    continue
-
-                a = flat2d[y0:y1, x0:x1]
-                b = flat2d[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
-                same = (a == b)
-                if not same.any():
-                    continue
-
-                yy, xx = np.nonzero(same)
-                ys = yy + y0
-                xs = xx + x0
-                src = ys.astype(np.int64) * w + xs
-                dst = src + dy * w + dx
-                bridge_chunks.append(np.stack([src, dst], axis=1))
-
-        if bridge_chunks:
-            edge_list.append(np.concatenate(bridge_chunks, axis=0))
-
-    edges = (np.concatenate(edge_list, axis=0)
-             if edge_list else np.empty((0, 2), np.int64))
-
-    # ---------- 3. Batch union-find ----------
-    parent = np.arange(n, dtype=np.int64)
-
-    def find_batch(a):
-        a = a.copy()
-        while True:
-            pa = parent[a]
-            g = parent[pa]
-            mask = pa != a
-            if not mask.any():
-                break
-            a = np.where(mask, g, a)
-        return a
-
-    if len(edges) > 0:
-        a = edges[:, 0]
-        b = edges[:, 1]
-        for _ in range(64):
-            ra = find_batch(a)
-            rb = find_batch(b)
-            # (D) 只对当前尚未连通的边做 union,减少无效 minimum.at 写入
-            mask = ra != rb
-            if not mask.any():
-                break
-            lo = np.minimum(ra[mask], rb[mask])
-            hi = np.maximum(ra[mask], rb[mask])
-            np.minimum.at(parent, hi, lo)
-            parent[a] = parent[parent[a]]
-            parent[b] = parent[parent[b]]
-
-    for _ in range(64):
-        p = parent.copy()
-        parent = parent[parent]
-        if np.array_equal(parent, p):
-            break
-
-    # ---------- 4. Remap + stats ----------
-    roots, labels_flat, area = np.unique(parent, return_inverse=True, return_counts=True)
-    labels = labels_flat.reshape(h, w).astype(np.int32)
-    comp_pal = flat[roots]
-
-    comp_info = np.column_stack([comp_pal, area])
-    return labels, comp_info
-
-
-def _dt_1d_sq(f):
-    """1D exact squared distance transform (Felzenszwalb & Huttenlocher).
-
-    Input f: float64 array of length n, f[i] is the initial cost
-        (foreground pixels f[i]=0, background pixels f[i]=+inf)
-    Output: d[i] = min_j ( (i-j)^2 + f[j] )
-    """
-    n = len(f)
-    d = np.empty(n, dtype=np.float64)
-    v = np.empty(n, dtype=np.int64)     # parabola locations
-    z = np.empty(n + 1, dtype=np.float64)  # parabola interval boundaries
-
-    k = 0
-    v[0] = 0
-    z[0] = -np.inf
-    z[1] = np.inf
-
-    for q in range(1, n):
-        # intersection of current parabola q with top-of-stack parabola v[k]
-        s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2.0 * q - 2.0 * v[k])
-        while s <= z[k]:
-            k -= 1
-            s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2.0 * q - 2.0 * v[k])
-        k += 1
-        v[k] = q
-        z[k] = s
-        z[k + 1] = np.inf
-
-    k = 0
-    for q in range(n):
-        while z[k + 1] < q:
-            k += 1
-        d[q] = (q - v[k]) * (q - v[k]) + f[v[k]]
-    return d
-
-
-def _dt_2d_sq(mask):
-    """2D exact squared Euclidean distance transform.
-
-    mask : (h, w) bool, True means "inside the region".
-    Returns : (h, w) float64, squared distance from each region pixel to the
-              nearest background pixel; background pixels are 0.
-    """
-    h, w = mask.shape
-    INF = np.float64(1e20)
-
-    # Column direction: first do 1D DT along each column
-    # f[i] = 0 if pixel is inside the region, else +inf
-    f = np.where(mask, 0.0, INF)          # (h, w)
-    # Call _dt_1d_sq column by column (loop w times, h elements each, acceptable)
-    col_dt = np.empty_like(f)
-    for x in range(w):
-        col_dt[:, x] = _dt_1d_sq(f[:, x])
-
-    # Row direction: do 1D DT along each row (using the previous result as f)
-    out = np.empty_like(col_dt)
-    for y in range(h):
-        out[y, :] = _dt_1d_sq(col_dt[y, :])
+        out = new_cells
     return out
 
-
-def _component_representative_points_dt(labels, comp_info, min_area,
-                                        edge_map=None, edge_weight=0.0):
-    """Approach B: use distance transform to pick, for each component, the pixel
-    farthest from the boundary as the representative point, ensuring it lies
-    inside the region and is visually centered.
-
-    If edge_map is provided and edge_weight > 0, the representative pixel is
-    chosen to balance 'far from boundary' (DT) with 'close to a strong image
-    edge' (edge_map). A small weight keeps the point inside the region while
-    nudging it toward visual boundaries.
-
-    Returns (centroids, comp_pal, comp_ids):
-        centroids : list[(x, y)]  pixel center coordinates
-        comp_pal  : list[int]     dominant color index of the component
-        comp_ids  : list[int]     index of the component in comp_info
+def _select_components_by_area_with_quota(comp_info, n_seeds, min_area, edge_energy=None, edge_bonus=0.0):
+    """Select up to n_seeds component indices directly from comp_info.
+    
+    1. Filter out components with area < min_area.
+    2. Guarantee at least one component per palette color (the largest one).
+    3. Fill the remaining budget with the largest components overall.
+    
+    comp_info[k] is expected to be a tuple where:
+      - comp_info[k][0] is the palette index
+      - comp_info[k][1] is the area
     """
-    centroids = []
-    comp_pal = []
-    comp_ids = []
-
-    # To avoid doing a full-image DT for each component (expensive), we only
-    # do a local DT within each component's bounding box. When the box is much
-    # smaller than the full image this gives a significant speedup.
-    for k, (color, area) in enumerate(comp_info):
-        if area < min_area:
-            continue
-
-        # --- pixel mask of this component + bounding box ---
-        ys, xs = np.nonzero(labels == k)
-        if len(ys) == 0:
-            continue
-        y0, y1 = int(ys.min()), int(ys.max()) + 1
-        x0, x1 = int(xs.min()), int(xs.max()) + 1
-
-        sub_mask = (labels[y0:y1, x0:x1] == k)  # (h', w') bool
-        dist_sq = _dt_2d_sq(sub_mask)
-
-        if edge_map is not None and edge_weight > 0.0:
-            sub_edge = edge_map[y0:y1, x0:x1]
-            dmax = dist_sq[sub_mask].max()
-            dt_norm = dist_sq / dmax if dmax > 0 else dist_sq
-            # Higher score = better: far from boundary AND strong edge.
-            score = dt_norm + edge_weight * sub_edge
-            # Only consider pixels actually inside the component.
-            score = np.where(sub_mask, score, -np.inf)
-        else:
-            score = dist_sq
-
-        # Pick the pixel with maximum score inside the region
-        # (argmax returns a flattened index)
-        flat_idx = int(np.argmax(score))
-        ry, rx = np.divmod(flat_idx, sub_mask.shape[1])
-
-        # Pixel center coordinates (+0.5)
-        cx = float(x0 + rx + 0.5)
-        cy = float(y0 + ry + 0.5)
-
-        centroids.append((cx, cy))
-        comp_pal.append(color)
-        comp_ids.append(k)
-
-    return centroids, comp_pal, comp_ids
-
-
-def _select_centroids_by_area_with_quota(comp_pal, comp_ids, comp_info,
-                                         n_seeds, edge_energy=None,
-                                         edge_bonus=0.0):
-    """Select up to n_seeds component indices:
-       1. Guarantee at least one component per palette color (the largest one).
-       2. Fill the remaining budget with the largest components overall.
-
-    If edge_energy is provided and edge_bonus > 0, both passes rank by
-    (normalized area) + edge_bonus * (normalized edge energy) instead of
-    pure area, so edge-rich components are preferred when the budget is tight.
-
-    Returns a sorted list of indices into the centroid/comp_pal lists.
-    """
-    m = len(comp_pal)
-    if m <= n_seeds:
-        return list(range(m))
-
-    areas = np.array([comp_info[k][1] for k in comp_ids], dtype=np.float64)
-    amax = areas.max()
-    a_norm = areas / amax if amax > 0 else areas
-
+    n = len(comp_info)
+    if n == 0:
+        return []
+    
+    areas = np.array([comp_info[k][1] for k in range(n)], dtype=np.float64)
+    pal = np.array([comp_info[k][0] for k in range(n)], dtype=np.int64)
+    
+    # Filter by min_area
+    valid = areas >= min_area
+    valid_idx = np.flatnonzero(valid)
+    if len(valid_idx) == 0:
+        return []
+    
+    if len(valid_idx) <= n_seeds:
+        return valid_idx.tolist()
+    
+    areas_v = areas[valid_idx]
+    pal_v = pal[valid_idx]
+    
+    amax = areas_v.max()
+    a_norm = areas_v / amax if amax > 0 else areas_v
+    
     if edge_energy is not None and edge_bonus > 0.0:
-        ee = edge_energy[np.asarray(comp_ids)]
+        ee = edge_energy[valid_idx]
         emax = ee.max()
         e_norm = ee / emax if emax > 0 else ee
         score = a_norm + edge_bonus * e_norm
     else:
         score = a_norm
-
-    pal = np.array(comp_pal, dtype=np.int64)
-
+    
     selected = set()
-
-    # ---- Pass 1: one (largest-score) component per palette color ----
-    # The first time we see a palette index in descending-score order is that
-    # color's best component.
+    
+    # Pass 1: one (largest-score) component per palette color
     order_desc = np.argsort(score)[::-1]
     seen_pal = set()
     for i in order_desc:
-        p = int(pal[i])
+        p = int(pal_v[i])
         if p not in seen_pal:
             seen_pal.add(p)
-            selected.add(int(i))
+            selected.add(int(valid_idx[i]))
             if len(selected) >= n_seeds:
                 break
-
-    # ---- Pass 2: fill remaining budget with highest-score components ----
+    
+    # Pass 2: fill remaining budget
     if len(selected) < n_seeds:
         for i in order_desc:
             if len(selected) >= n_seeds:
                 break
-            i = int(i)
-            if i not in selected:
-                selected.add(i)
-
-    # Stable output order
+            i_idx = int(valid_idx[i])
+            if i_idx not in selected:
+                selected.add(i_idx)
+    
     return sorted(selected)
-
 
 def knife_cut_cells(img_small, pal_indices, n_palette, w, h, n_seeds, rng,
                     seed_from_edges=False, bridge_ratio=0.01,
                     edge_weight=0.5, edge_bonus=0.5):
+    """Knife-cut stained glass using the *edges* of each component's maximum
+    inscribed triangle as cutting lines.
+
+    Components whose MIT cannot be computed are simply skipped (no fallback
+    triangle is generated).
+    """
     # Step 1: same-color connected components
     bridge_r = int(round(max(w, h) * bridge_ratio))
     min_area = w * h / (n_seeds * n_palette)
-    labels, comp_info = _same_color_components(
+    labels, comp_info = same_color_components(
         pal_indices, bridge_radius=bridge_r
     )
 
-    # Optional edge map (shared by representative placement, selection, cuts)
+    # Optional edge map (used to bias component selection)
     edge_map = None
     edge_energy = None
     if seed_from_edges:
@@ -903,33 +729,50 @@ def knife_cut_cells(img_small, pal_indices, n_palette, w, h, n_seeds, rng,
         edge_map = _edge_map(gray)
         edge_energy = _component_edge_energy(comp_info, labels, edge_map)
 
-    # Step 2/3: use DT to find a centered representative point for each component
-    centroids, comp_pal, comp_ids = _component_representative_points_dt(
-        labels, comp_info, min_area,
-        edge_map=edge_map,
-        edge_weight=edge_weight if seed_from_edges else 0.0,
+    # Step 2: select components
+    comp_ids = _select_components_by_area_with_quota(
+        comp_info, n_seeds, min_area,
+        edge_energy=edge_energy,
+        edge_bonus=edge_bonus if seed_from_edges else 0.0,
     )
-    if not centroids:
-        return []
 
-    # Step 4: if there are too many components, keep the largest by area,
-    #         guaranteeing at least one component per palette color.
-    if len(centroids) > n_seeds:
-        keep = _select_centroids_by_area_with_quota(
-            comp_pal, comp_ids, comp_info, int(n_seeds),
-            edge_energy=edge_energy,
-            edge_bonus=edge_bonus if seed_from_edges else 0.0,
+    # Step 3: collect edge lines of the MIT for every surviving component.
+    # Components whose MIT fails are dropped entirely.
+    all_lines = []
+    for cid in comp_ids:
+        mask = (labels == cid)
+        ys, xs = np.nonzero(mask)
+        if len(xs) < 3:
+            continue
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        sub = mask[y0:y1, x0:x1].astype(np.uint8)
+
+        tri_c, area_c, circle = _circle_contact_triangle(sub, rng=rng)
+        if tri_c is None:
+            continue
+        a, b, c = _triangle_edges(tri_c + (x0, y0))
+        all_lines.append(
+            np.column_stack([a, b, c, np.full(len(a), area_c)])
         )
-        centroids = [centroids[i] for i in keep]
 
-    # Step 5: Voronoi cut (edge-biased pair selection when edge_map is present)
-    final_polys = centroid_cut_sparse(
-        centroids, float(w), float(h), rng,
-        edge_map=edge_map if seed_from_edges else None,
-    )
-    if not final_polys:
-        return []
-    return final_polys
+    all_lines = np.concatenate(all_lines)
+    if len(all_lines) > n_seeds:
+        weights = all_lines[:,3]
+        wsum = weights.sum()
+        if wsum <= 0.0:
+            weights = np.ones_like(weights)
+            wsum = weights.sum()
+        weights /= wsum
+        all_lines = rng.choice(all_lines, n_seeds, replace=False, p=weights)
+    
+    cells = [[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]]
+    if not all_lines.any():
+        return cells
+
+    # Step 4: apply every edge line as a cut, starting from the full rectangle.
+    cells = _cut_cells_by_lines(cells, all_lines, n_seeds)
+    return cells
 
 
 # ---------- Triangle-based per-cell sampling ----------
@@ -1046,7 +889,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         except Exception as e:
             inkex.errormsg(f"Cannot read image: {e}")
             return
-       
+      
         orig_w, orig_h = img.size
         max_dim = self.options.max_dim
         if max(orig_w, orig_h) > max_dim:
@@ -1060,7 +903,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         blur_size = max(0, self.options.blur_size)
         if blur_size > 0:
             blur_size = int(blur_size) // 2 * 2 + 1
-            img = img.filter(ImageFilter.MedianFilter(size=blur_size))
+            img_small = img_small.filter(ImageFilter.MedianFilter(size=blur_size))
 
         if w < 1 or h < 1:
             inkex.errormsg("Image is too small.")
