@@ -563,6 +563,64 @@ def centroid_cut_sparse(centroids, w, h, rng, edge_map=None):
         cells = new_cells
     return cells
 
+def _select_centroids_by_area_with_quota(comp_pal, comp_ids, comp_info,
+                                         n_seeds, edge_energy=None,
+                                         edge_bonus=0.0):
+    """Select up to n_seeds component indices:
+       1. Guarantee at least one component per palette color (the largest one).
+       2. Fill the remaining budget with the largest components overall.
+
+    If edge_energy is provided and edge_bonus > 0, both passes rank by
+    (normalized area) + edge_bonus * (normalized edge energy) instead of
+    pure area, so edge-rich components are preferred when the budget is tight.
+
+    Returns a sorted list of indices into the centroid/comp_pal lists.
+    """
+    m = len(comp_pal)
+    if m <= n_seeds:
+        return list(range(m))
+
+    areas = np.array([comp_info[k][1] for k in comp_ids], dtype=np.float64)
+    amax = areas.max()
+    a_norm = areas / amax if amax > 0 else areas
+
+    if edge_energy is not None and edge_bonus > 0.0:
+        ee = edge_energy[np.asarray(comp_ids)]
+        emax = ee.max()
+        e_norm = ee / emax if emax > 0 else ee
+        score = a_norm + edge_bonus * e_norm
+    else:
+        score = a_norm
+
+    pal = np.array(comp_pal, dtype=np.int64)
+
+    selected = set()
+
+    # ---- Pass 1: one (largest-score) component per palette color ----
+    # The first time we see a palette index in descending-score order is that
+    # color's best component.
+    order_desc = np.argsort(score)[::-1]
+    seen_pal = set()
+    for i in order_desc:
+        p = int(pal[i])
+        if p not in seen_pal:
+            seen_pal.add(p)
+            selected.add(int(i))
+            if len(selected) >= n_seeds:
+                break
+
+    # ---- Pass 2: fill remaining budget with highest-score components ----
+    if len(selected) < n_seeds:
+        for i in order_desc:
+            if len(selected) >= n_seeds:
+                break
+            i = int(i)
+            if i not in selected:
+                selected.add(i)
+
+    # Stable output order
+    return sorted(selected)
+
 def knife_cut_cells(img_small, pal_indices, n_palette, w, h, n_seeds, rng,
                     seed_from_edges=False, bridge_ratio=0.01,
                     edge_weight=0.5, edge_bonus=0.5):
