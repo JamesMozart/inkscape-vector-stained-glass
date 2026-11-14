@@ -502,7 +502,7 @@ def _pair_edge_score(pts, i, j, edge_map):
     yj = int(np.clip(pts[j][1], 0, h - 1))
     return 0.5 * (edge_map[yi, xi] + edge_map[yj, xj])
 
-def centroid_cut_sparse(centroids, w, h, rng, edge_map=None):
+def centroid_cut_sparse(centroids, w, h, n_seeds, rng, edge_map=None):
     """Each centroid only cuts against its single nearest neighbor.
 
     If edge_map is provided, the (random) subset of pairs is chosen with a
@@ -545,6 +545,8 @@ def centroid_cut_sparse(centroids, w, h, rng, edge_map=None):
     # Start with full rectangle, cut by each pair's bisector
     cells = [[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]]
     for (i, j) in pairs:
+        if len(cells) > n_seeds:
+            break
         xi, yi = pts[i]
         xj, yj = pts[j]
         a = 2.0 * (xj - xi)
@@ -660,7 +662,7 @@ def knife_cut_cells(img_small, pal_indices, n_palette, w, h, n_seeds, rng,
 
     # Step 5: Voronoi cut (edge-biased pair selection when edge_map is present)
     final_polys = centroid_cut_sparse(
-        centroids, float(w), float(h), rng,
+        centroids, float(w), float(h), n_seeds, rng,
         edge_map=edge_map if seed_from_edges else None,
     )
     if not final_polys:
