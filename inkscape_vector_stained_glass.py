@@ -544,14 +544,15 @@ def centroid_cut_sparse(centroids, w, h, n_seeds, rng, edge_map=None):
 
     # Start with full rectangle, cut by each pair's bisector
     cells = [[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]]
-    for (i, j) in pairs:
+    ptsi = pts[pairs[:,0]]
+    ptsj = pts[pairs[:,1]]
+    abc = np.column_stack([
+        2.0 * (ptsj - ptsi),
+        (ptsi * ptsi - ptsj * ptsj).sum(axis=1)
+    ])
+    for (a, b, c) in abc:
         if len(cells) > n_seeds:
             break
-        xi, yi = pts[i]
-        xj, yj = pts[j]
-        a = 2.0 * (xj - xi)
-        b = 2.0 * (yj - yi)
-        c = (xi * xi + yi * yi) - (xj * xj + yj * yj)
         new_cells = []
         for poly in cells:
             left = clip_polygon_halfplane(poly, a, b, c)
