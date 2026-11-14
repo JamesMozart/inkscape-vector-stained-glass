@@ -69,23 +69,28 @@ def clip_polygon_rect(poly, w, h):
     return poly
 
 
+def solve_linear_abc(pts1, pts2):
+    return np.column_stack([
+        2.0 * (pts1 - pts2),
+        (pts2 * pts2 - pts1 * pts1).sum(axis=1)
+    ])
+
+
 def voronoi_cell(i, seeds, rect_w, rect_h, neighbors_idx=None):
     """Compute Voronoi cell of seed i, optionally only clipping against neighbors."""
     poly = [(0.0, 0.0), (rect_w, 0.0), (rect_w, rect_h), (0.0, rect_h)]
-    xi, yi = seeds[i]
+    seedi = seeds[i]
 
     if neighbors_idx is not None:
-        iter_j = neighbors_idx[i]
+        seeds = seeds[neighbors_idx]
     else:
-        iter_j = range(len(seeds))
+        mask = np.ones(len(seeds), dtype=bool)
+        mask[i] = False
+        seeds = seeds[mask]
 
-    for j in iter_j:
-        if j == i:
-            continue
-        xj, yj = seeds[j]
-        a = 2.0 * (xj - xi)
-        b = 2.0 * (yj - yi)
-        c = (xi * xi + yi * yi) - (xj * xj + yj * yj)
+    abc = solve_linear_abc(seeds, seedi)
+
+    for (a, b, c) in abc:
         poly = clip_polygon_halfplane(poly, a, b, c)
         if len(poly) < 3:
             return None
@@ -546,10 +551,7 @@ def centroid_cut_sparse(centroids, w, h, n_seeds, rng, edge_map=None):
     cells = [[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]]
     ptsi = pts[pairs[:,0]]
     ptsj = pts[pairs[:,1]]
-    abc = np.column_stack([
-        2.0 * (ptsj - ptsi),
-        (ptsi * ptsi - ptsj * ptsj).sum(axis=1)
-    ])
+    abc = solve_linear_abc(ptsi, ptsj)
     for (a, b, c) in abc:
         if len(cells) > n_seeds:
             break
