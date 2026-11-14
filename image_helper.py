@@ -1,5 +1,6 @@
 import numpy as np
 from PIL import Image
+from concurrent.futures import ThreadPoolExecutor
 
 # ---------- sRGB <-> Lab (D65) pure NumPy implementation ----------
 
@@ -192,7 +193,7 @@ def same_color_components(pal_indices, bridge_radius=0):
     # ---------- 2. Bridge edges for gaps up to r pixels ----------
     if r > 1:
         flat2d = flat.reshape(h, w)
-        bridge_chunks = []
+        tasks = []
         for dy in range(0, r + 1):
             for dx in range(-r, r + 1):
                 if dy == 0 and dx == 0:
@@ -208,18 +209,26 @@ def same_color_components(pal_indices, bridge_radius=0):
                 if y1 <= y0 or x1 <= x0:
                     continue
 
-                a = flat2d[y0:y1, x0:x1]
-                b = flat2d[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
-                same = (a == b)
-                if not same.any():
-                    continue
+                tasks.append((x0, x1, y0, y1, dx, dy))
 
-                yy, xx = np.nonzero(same)
-                ys = yy + y0
-                xs = xx + x0
-                src = ys.astype(np.int64) * w + xs
-                dst = src + dy * w + dx
-                bridge_chunks.append(np.stack([src, dst], axis=1))
+        def _process(args):
+            x0, x1, y0, y1, dx, dy = args
+
+            a = flat2d[y0:y1, x0:x1]
+            b = flat2d[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
+            same = (a == b)
+            if not same.any():
+                return
+
+            yy, xx = np.nonzero(same)
+            ys = yy + y0
+            xs = xx + x0
+            src = ys.astype(np.int64) * w + xs
+            dst = src + dy * w + dx
+            return np.stack([src, dst], axis=1)
+
+        with ThreadPoolExecutor() as ex:
+            bridge_chunks = [x for x in  ex.map(_process, tasks) if x is not None]
 
         if bridge_chunks:
             edge_list.append(np.concatenate(bridge_chunks, axis=0))
@@ -334,14 +343,7 @@ def _dt_2d_sq(mask):
 
 def component_representative_points_dt(labels, comp_info, min_area,
                                         edge_map=None, edge_weight=0.0):
-    """Approach B: use distance transform to pick, for each component, the pixel
-    farthest from the boundary as the representative point, ensuring it lies
-    inside the region and is visually centered.
-
-    If edge_map is provided and edge_weight > 0, the representative pixel is
-    chosen to balance 'far from boundary' (DT) with 'close to a strong image
-    edge' (edge_map). A small weight keeps the point inside the region while
-    nudging it toward visual boundaries.
+    """Same as before, but each component's DT/argmax is computed in parallel.
 
     Returns (centroids, comp_pal, comp_ids):
         centroids : list[(x, y)]  pixel center coordinates
@@ -352,19 +354,28 @@ def component_representative_points_dt(labels, comp_info, min_area,
     comp_pal = []
     comp_ids = []
 
-    # To avoid doing a full-image DT for each component (expensive), we only
-    # do a local DT within each component's bounding box. When the box is much
-    # smaller than the full image this gives a significant speedup.
+    # --- Phase 1 (sequential): compute bounding boxes ---
+    # np.nonzero on the full label image is cheap-ish, but doing it per
+    # component sequentially keeps memory low. If this becomes the bottleneck,
+    # it can also be parallelized, but shared-array reads are fine as-is.
+    tasks = []
     for k, (color, area) in enumerate(comp_info):
         if area < min_area:
             continue
-
-        # --- pixel mask of this component + bounding box ---
         ys, xs = np.nonzero(labels == k)
         if len(ys) == 0:
             continue
         y0, y1 = int(ys.min()), int(ys.max()) + 1
         x0, x1 = int(xs.min()), int(xs.max()) + 1
+        tasks.append((k, color, labels, y0, y1, x0, x1,
+                      edge_map, edge_weight))
+
+    if not tasks:
+        return centroids, comp_pal, comp_ids
+
+    def _process_component(args):
+        """Worker: handle one component and return its representative point or None."""
+        k, color, labels, y0, y1, x0, x1, edge_map, edge_weight = args
 
         sub_mask = (labels[y0:y1, x0:x1] == k)  # (h', w') bool
         dist_sq = _dt_2d_sq(sub_mask)
@@ -373,23 +384,27 @@ def component_representative_points_dt(labels, comp_info, min_area,
             sub_edge = edge_map[y0:y1, x0:x1]
             dmax = dist_sq[sub_mask].max()
             dt_norm = dist_sq / dmax if dmax > 0 else dist_sq
-            # Higher score = better: far from boundary AND strong edge.
             score = dt_norm + edge_weight * sub_edge
-            # Only consider pixels actually inside the component.
             score = np.where(sub_mask, score, -np.inf)
         else:
             score = dist_sq
 
-        # Pick the pixel with maximum score inside the region
-        # (argmax returns a flattened index)
         flat_idx = int(np.argmax(score))
         ry, rx = np.divmod(flat_idx, sub_mask.shape[1])
 
-        # Pixel center coordinates (+0.5)
         cx = float(x0 + rx + 0.5)
         cy = float(y0 + ry + 0.5)
+        return (cx, cy), color, k
 
-        centroids.append((cx, cy))
+    # --- Phase 2 (parallel): per-component DT + argmax ---
+    # NOTE: _dt_2d_sq releases the GIL if it's backed by scipy/numpy ops,
+    # so ThreadPoolExecutor gives real speedup here. If _dt_2d_sq is pure
+    # Python, switch to ProcessPoolExecutor instead.
+    with ThreadPoolExecutor() as ex:
+        results = list(ex.map(_process_component, tasks))
+
+    for centroid, color, k in results:
+        centroids.append(centroid)
         comp_pal.append(color)
         comp_ids.append(k)
 
