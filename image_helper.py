@@ -315,6 +315,33 @@ def _dt_1d_sq(f):
         d[q] = (q - v[k]) * (q - v[k]) + f[v[k]]
     return d
 
+def _dt_1d_sq_binary(fg):
+    """二值输入的 1D 平方距离变换。
+
+    fg: bool/0-1 array, True(1)=前景(=0 成本), False(0)=背景(=+inf 成本)
+    返回 d[i] = min_{j: fg[j]} (i-j)^2
+    """
+    fg = np.asarray(fg, dtype=bool)
+    n = fg.shape[0]
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+    if not fg.any():
+        return np.full(n, np.inf)
+
+    idx = np.arange(n)
+    INF = n  # 足够大的哨兵（> 任何可能的 |i-j|）
+
+    # 从左边最近的前景：向左累积最小值
+    left = np.where(fg, idx, INF)
+    left = np.minimum.accumulate(left)          # left[i] = 左边最近前景的下标
+
+    # 从右边最近的前景：向右累积最小值
+    right = np.where(fg, idx, INF)
+    right = np.minimum.accumulate(right[::-1])[::-1]  # right[i] = 右边最近前景下标
+
+    dl = np.where(left  == INF, np.inf, (idx - left)**2)
+    dr = np.where(right == INF, np.inf, (right - idx)**2)
+    return np.minimum(dl, dr)
 
 def _dt_2d_sq(mask):
     """2D exact squared Euclidean distance transform.
@@ -332,12 +359,12 @@ def _dt_2d_sq(mask):
     # Call _dt_1d_sq column by column (loop w times, h elements each, acceptable)
     col_dt = np.empty_like(f)
     for x in range(w):
-        col_dt[:, x] = _dt_1d_sq(f[:, x])
+        col_dt[:, x] = _dt_1d_sq_binary(f[:, x])
 
     # Row direction: do 1D DT along each row (using the previous result as f)
     out = np.empty_like(col_dt)
     for y in range(h):
-        out[y, :] = _dt_1d_sq(col_dt[y, :])
+        out[y, :] = _dt_1d_sq_binary(col_dt[y, :])
     return out
 
 
