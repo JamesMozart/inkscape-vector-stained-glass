@@ -2,6 +2,8 @@ import numpy as np
 from PIL import Image
 from concurrent.futures import ThreadPoolExecutor
 
+thread_pool = ThreadPoolExecutor()
+
 # ---------- sRGB <-> Lab (D65) pure NumPy implementation ----------
 
 def _srgb_to_linear(c):
@@ -173,53 +175,52 @@ def same_color_components(pal_indices, bridge_radius=0):
     rows = np.arange(h, dtype=np.int64)
     cols = np.arange(w, dtype=np.int64)
 
-    with ThreadPoolExecutor() as ex:
-        def _process_4(rows_src, cols_src, flat_offset):
-            src = (rows_src * w + cols_src).ravel()
-            same = flat[src] == flat[src + flat_offset]
-            return np.stack([src[same], src[same] + flat_offset], axis=1)
+    def _process_4(rows_src, cols_src, flat_offset):
+        src = (rows_src * w + cols_src).ravel()
+        same = flat[src] == flat[src + flat_offset]
+        return np.stack([src[same], src[same] + flat_offset], axis=1)
 
-        futs = [
-            ex.submit(_process_4, rows[:, None], cols[None, :w - 1], 1),
-            ex.submit(_process_4, rows[:h - 1, None], cols[None, :], w),
-            ex.submit(_process_4, rows[:h - 1, None], cols[None, :w - 1], w + 1),
-            ex.submit(_process_4, rows[:h - 1, None], cols[None, 1:], w - 1)
-        ]
+    futs = [
+        thread_pool.submit(_process_4, rows[:, None], cols[None, :w - 1], 1),
+        thread_pool.submit(_process_4, rows[:h - 1, None], cols[None, :], w),
+        thread_pool.submit(_process_4, rows[:h - 1, None], cols[None, :w - 1], w + 1),
+        thread_pool.submit(_process_4, rows[:h - 1, None], cols[None, 1:], w - 1)
+    ]
 
-        # ---------- 2. Bridge edges for gaps up to r pixels ----------
-        if r > 1:
-            flat2d = flat.reshape(h, w)
+    # ---------- 2. Bridge edges for gaps up to r pixels ----------
+    if r > 1:
+        flat2d = flat.reshape(h, w)
 
-            def _process(x0, x1, y0, y1, dx, dy):
-                a = flat2d[y0:y1, x0:x1]
-                b = flat2d[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
-                same = (a == b)
-                if not same.any():
-                    return np.empty((0, 2), np.int64)
+        def _process(x0, x1, y0, y1, dx, dy):
+            a = flat2d[y0:y1, x0:x1]
+            b = flat2d[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
+            same = (a == b)
+            if not same.any():
+                return np.empty((0, 2), np.int64)
 
-                yy, xx = np.nonzero(same)
-                ys = yy + y0
-                xs = xx + x0
-                src = ys.astype(np.int64) * w + xs
-                dst = src + dy * w + dx
-                return np.stack([src, dst], axis=1)
+            yy, xx = np.nonzero(same)
+            ys = yy + y0
+            xs = xx + x0
+            src = ys.astype(np.int64) * w + xs
+            dst = src + dy * w + dx
+            return np.stack([src, dst], axis=1)
 
-            for dy in range(0, r + 1):
-                for dx in range(-r, r + 1):
-                    if dy == 0 and dx == 0:
-                        continue
-                    # shell of the Chebyshev ball of radius r
-                    if max(abs(dy), abs(dx)) != r:
-                        continue
-                    if dy == 0 and dx < 0:
-                        continue
+        for dy in range(0, r + 1):
+            for dx in range(-r, r + 1):
+                if dy == 0 and dx == 0:
+                    continue
+                # shell of the Chebyshev ball of radius r
+                if max(abs(dy), abs(dx)) != r:
+                    continue
+                if dy == 0 and dx < 0:
+                    continue
 
-                    y0, y1 = max(0, -dy), min(h, h - dy)
-                    x0, x1 = max(0, -dx), min(w, w - dx)
-                    if y1 <= y0 or x1 <= x0:
-                        continue
+                y0, y1 = max(0, -dy), min(h, h - dy)
+                x0, x1 = max(0, -dx), min(w, w - dx)
+                if y1 <= y0 or x1 <= x0:
+                    continue
 
-                    futs.append(ex.submit(_process, x0, x1, y0, y1, dx, dy))
+                futs.append(thread_pool.submit(_process, x0, x1, y0, y1, dx, dy))
 
         edge_list = [f.result() for f in futs]
 
@@ -417,10 +418,7 @@ def component_representative_points_dt(labels, comp_info, min_area,
     # NOTE: _dt_2d_sq releases the GIL if it's backed by scipy/numpy ops,
     # so ThreadPoolExecutor gives real speedup here. If _dt_2d_sq is pure
     # Python, switch to ProcessPoolExecutor instead.
-    with ThreadPoolExecutor() as ex:
-        results = list(ex.map(_process_component, tasks))
-
-    for centroid, color, k in results:
+    for centroid, color, k in thread_pool.map(_process_component, tasks):
         centroids.append(centroid)
         comp_pal.append(color)
         comp_ids.append(k)

@@ -5,11 +5,11 @@ import io
 import base64
 import os
 from PIL import Image, ImageFilter
+from concurrent.futures import ThreadPoolExecutor
 
 from inkex.units import convert_unit
 
-from image_helper import pil_quantize_indices, same_color_components, component_representative_points_dt
-
+from image_helper import pil_quantize_indices, same_color_components, component_representative_points_dt, thread_pool
 
 # ---------- Geometry helpers ----------
 
@@ -525,11 +525,10 @@ def centroid_cut_sparse(centroids, w, h, n_seeds, rng, edge_map=None):
     nn = d.argmin(axis=1)
 
     # Deduplicate undirected pairs (i, nn[i])
-    pairs = set()
-    for i in range(n):
-        j = int(nn[i])
-        pairs.add((min(i, j), max(i, j)))
-    pairs = np.array(list(pairs))
+    i_arr = np.arange(n)
+    lo = np.minimum(i_arr, nn)
+    hi = np.maximum(i_arr, nn)
+    pairs = np.unique(np.stack([lo, hi], axis=1), axis=0)
 
     # Choose n//2 pairs. With an edge map, bias selection by edge strength.
     k = max(1, n // 2)
@@ -683,8 +682,8 @@ def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
     """
     h_img, w_img = pal_indices.shape
     flat_pal = pal_indices.ravel()
-    results = []
-    for poly in polygons:
+
+    def _process(poly):
         xs = [p[0] for p in poly]
         ys = [p[1] for p in poly]
         x0 = max(0, int(np.floor(min(xs))))
@@ -692,8 +691,7 @@ def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
         y0 = max(0, int(np.floor(min(ys))))
         y1 = min(h_img, int(np.ceil(max(ys))) + 1)
         if x1 <= x0 or y1 <= y0:
-            results.append(0)
-            continue
+            return 0
         # Pixel centers in bbox
         gx, gy = np.meshgrid(np.arange(x0, x1) + 0.5, np.arange(y0, y1) + 0.5)
         # Point-in-polygon (ray casting) — vectorized over pixels
@@ -707,8 +705,7 @@ def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
             x_int = (bx - ax) * (gy - ay) / (by - ay + 1e-12) + ax
             inside ^= cond & (gx < x_int)
         if not inside.any():
-            results.append(0)
-            continue
+            return 0
         idx = np.where(inside.ravel())[0]
         # Map flat local index back to global pixel index
         local_y, local_x = np.divmod(idx, (x1 - x0))
@@ -717,7 +714,9 @@ def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
         flat = glob_y * w_img + glob_x
         vals = flat_pal[flat]
         counts = np.bincount(vals, minlength=n_palette)
-        results.append(int(np.argmax(counts)))
+        return int(np.argmax(counts))
+
+    results = list(thread_pool.map(_process, polygons))
     return np.array(results, dtype=np.int32)
 
 
@@ -852,22 +851,28 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
             else:
                 seeds = grid_seeds(w, h, n_seeds, rng=rng)
 
-            region_labels = voronoi_region_labels(seeds, w, h)
             n_cells = len(seeds)
-            dom_idx = dominant_palette_index(region_labels, pal_indices, n_cells, n_palette)
 
-            for i in range(n_cells):
+            def _process(i):
                 poly = voronoi_cell(i, seeds, float(w), float(h), None)
                 if poly is None or len(poly) < 3:
-                    continue
+                    return
                 poly = simplify_poly(poly)
                 if len(poly) < 3:
-                    continue
-                xs = [p[0] for p in poly]
-                ys = [p[1] for p in poly]
-                if (max(xs) - min(xs)) * (max(ys) - min(ys)) < 4.0:
-                    continue
-                polygons.append(poly)
+                    return
+
+                lo = np.min(poly, axis=0)
+                hi = np.max(poly, axis=0)
+
+                if (hi - lo).prod() < 4.0:
+                    return
+                return poly
+
+            polygons = [x for x in thread_pool.map(_process, range(n_cells)) if x is not None]
+
+            dom_idx = dominant_palette_index_for_polygons(
+                polygons, pal_indices, n_palette, w, h
+            )
 
         # 5. Build SVG paths
         group = inkex.Group()
