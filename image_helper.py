@@ -106,6 +106,7 @@ def pil_quantize_indices(img_small, k, max_iter=20, sample_size=50000):
     K = max(2, int(k))
 
     # 1. Use MEDIANCUT to get the initial palette (as initial Lab-space centers)
+    img_small = img_small.convert("RGB")
     q0 = img_small.quantize(
         colors=K,
         method=Image.Quantize.MEDIANCUT,
@@ -117,7 +118,7 @@ def pil_quantize_indices(img_small, k, max_iter=20, sample_size=50000):
     init_rgb = np.array(pal_flat0[: n_actual * 3], dtype=np.uint8).reshape(-1, 3)
 
     # 2. Extract pixels and convert to Lab (subsample for speed)
-    arr = np.asarray(img_small.convert("RGB"), dtype=np.uint8).reshape(-1, 3)
+    arr = np.asarray(img_small, dtype=np.uint8).reshape(-1, 3)
     if arr.shape[0] > sample_size:
         rng = np.random.default_rng(0)
         sel = rng.choice(arr.shape[0], sample_size, replace=False)
@@ -139,7 +140,7 @@ def pil_quantize_indices(img_small, k, max_iter=20, sample_size=50000):
     flat += [0] * (768 - len(flat))
     pal_img.putpalette(flat)
 
-    q = img_small.convert("RGB").quantize(
+    q = img_small.quantize(
         palette=pal_img, dither=Image.Dither.NONE
     )
     indices = np.array(q, dtype=np.int32)
@@ -168,70 +169,59 @@ def same_color_components(pal_indices, bridge_radius=0):
     n = flat.size
     r = int(max(0, bridge_radius))
 
-    edge_list = []
-
     # ---------- 1. Strict 8-neighborhood edges (always) ----------
     rows = np.arange(h, dtype=np.int64)
     cols = np.arange(w, dtype=np.int64)
 
-    left = (rows[:, None] * w + cols[None, :w - 1]).ravel()
-    same_h = flat[left] == flat[left + 1]
-    edge_list.append(np.stack([left[same_h], left[same_h] + 1], axis=1))
+    with ThreadPoolExecutor() as ex:
+        def _process_4(rows_src, cols_src, flat_offset):
+            src = (rows_src * w + cols_src).ravel()
+            same = flat[src] == flat[src + flat_offset]
+            return np.stack([src[same], src[same] + flat_offset], axis=1)
 
-    top = (rows[:h - 1, None] * w + cols[None, :]).ravel()
-    same_v = flat[top] == flat[top + w]
-    edge_list.append(np.stack([top[same_v], top[same_v] + w], axis=1))
+        futs = [
+            ex.submit(_process_4, rows[:, None], cols[None, :w - 1], 1),
+            ex.submit(_process_4, rows[:h - 1, None], cols[None, :], w),
+            ex.submit(_process_4, rows[:h - 1, None], cols[None, :w - 1], w + 1),
+            ex.submit(_process_4, rows[:h - 1, None], cols[None, 1:], w - 1)
+        ]
 
-    dr = (rows[:h - 1, None] * w + cols[None, :w - 1]).ravel()
-    same_dr = flat[dr] == flat[dr + w + 1]
-    edge_list.append(np.stack([dr[same_dr], dr[same_dr] + w + 1], axis=1))
+        # ---------- 2. Bridge edges for gaps up to r pixels ----------
+        if r > 1:
+            flat2d = flat.reshape(h, w)
 
-    dl = (rows[:h - 1, None] * w + cols[None, 1:]).ravel()
-    same_dl = flat[dl] == flat[dl + w - 1]
-    edge_list.append(np.stack([dl[same_dl], dl[same_dl] + w - 1], axis=1))
+            def _process(x0, x1, y0, y1, dx, dy):
+                a = flat2d[y0:y1, x0:x1]
+                b = flat2d[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
+                same = (a == b)
+                if not same.any():
+                    return np.empty((0, 2), np.int64)
 
-    # ---------- 2. Bridge edges for gaps up to r pixels ----------
-    if r > 1:
-        flat2d = flat.reshape(h, w)
-        tasks = []
-        for dy in range(0, r + 1):
-            for dx in range(-r, r + 1):
-                if dy == 0 and dx == 0:
-                    continue
-                # shell of the Chebyshev ball of radius r
-                if max(abs(dy), abs(dx)) != r:
-                    continue
-                if dy == 0 and dx < 0:
-                    continue
+                yy, xx = np.nonzero(same)
+                ys = yy + y0
+                xs = xx + x0
+                src = ys.astype(np.int64) * w + xs
+                dst = src + dy * w + dx
+                return np.stack([src, dst], axis=1)
 
-                y0, y1 = max(0, -dy), min(h, h - dy)
-                x0, x1 = max(0, -dx), min(w, w - dx)
-                if y1 <= y0 or x1 <= x0:
-                    continue
+            for dy in range(0, r + 1):
+                for dx in range(-r, r + 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    # shell of the Chebyshev ball of radius r
+                    if max(abs(dy), abs(dx)) != r:
+                        continue
+                    if dy == 0 and dx < 0:
+                        continue
 
-                tasks.append((x0, x1, y0, y1, dx, dy))
+                    y0, y1 = max(0, -dy), min(h, h - dy)
+                    x0, x1 = max(0, -dx), min(w, w - dx)
+                    if y1 <= y0 or x1 <= x0:
+                        continue
 
-        def _process(args):
-            x0, x1, y0, y1, dx, dy = args
+                    futs.append(ex.submit(_process, x0, x1, y0, y1, dx, dy))
 
-            a = flat2d[y0:y1, x0:x1]
-            b = flat2d[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
-            same = (a == b)
-            if not same.any():
-                return
-
-            yy, xx = np.nonzero(same)
-            ys = yy + y0
-            xs = xx + x0
-            src = ys.astype(np.int64) * w + xs
-            dst = src + dy * w + dx
-            return np.stack([src, dst], axis=1)
-
-        with ThreadPoolExecutor() as ex:
-            bridge_chunks = [x for x in  ex.map(_process, tasks) if x is not None]
-
-        if bridge_chunks:
-            edge_list.append(np.concatenate(bridge_chunks, axis=0))
+        edge_list = [f.result() for f in futs]
 
     edges = (np.concatenate(edge_list, axis=0)
              if edge_list else np.empty((0, 2), np.int64))
