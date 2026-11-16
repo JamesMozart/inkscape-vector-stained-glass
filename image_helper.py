@@ -108,7 +108,6 @@ def pil_quantize_indices(img_small, k, max_iter=20, sample_size=50000):
     K = max(2, int(k))
 
     # 1. Use MEDIANCUT to get the initial palette (as initial Lab-space centers)
-    img_small = img_small.convert("RGB")
     q0 = img_small.quantize(
         colors=K,
         method=Image.Quantize.MEDIANCUT,

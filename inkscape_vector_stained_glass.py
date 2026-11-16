@@ -5,7 +5,6 @@ import io
 import base64
 import os
 from PIL import Image, ImageFilter
-from concurrent.futures import ThreadPoolExecutor
 
 from inkex.units import convert_unit
 
@@ -409,17 +408,25 @@ def grid_seeds(w, h, n_seeds, min_dist=None, rng=None):
     return seeds[:n_found]
 
 
-def edge_weighted_seeds(w, h, n_seeds, gray, rng=None):
-    """Sample seeds with probability proportional to edge strength."""
-    if rng is None:
-        rng = np.random.default_rng()
-    gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
-    gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
-    edge_map = gx + gy
-    prob = edge_map.ravel() + edge_map.mean() * 0.5
-    prob /= prob.sum()
-    idx = rng.choice(w * h, n_seeds, replace=False, p=prob)
-    return np.stack([idx % w, idx // w], axis=1).astype(np.float64)
+def generate_seeds(w, h, n_seeds, img_small, rng, bias_type):
+    if bias_type == 'edges':
+        gray = np.array(img_small.convert("L"), dtype=np.float64)
+        gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
+        gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
+        edge_map = gx + gy
+        prob = edge_map.ravel() + edge_map.mean() * 0.5
+        prob /= prob.sum()
+        idx = rng.choice(w * h, n_seeds, replace=False, p=prob)
+        return np.stack([idx % w, idx // w], axis=1).astype(np.float64)
+    elif bias_type == 'brightness':
+        gray = np.array(img_small.convert("L"), dtype=np.float64)
+        prob = 256.0 - gray.ravel()
+        prob /= prob.sum()
+        idx = rng.choice(w * h, n_seeds, replace=False, p=prob)
+        return np.stack([idx % w, idx // w], axis=1).astype(np.float64)
+    
+    return grid_seeds(w, h, n_seeds, rng=rng)
+    
 
 
 def _edge_map(gray):
@@ -569,14 +576,20 @@ def centroid_cut_sparse(centroids, w, h, n_seeds, rng, edge_map=None):
 
 def _select_centroids_by_area_with_quota(comp_pal, comp_ids, comp_info,
                                          n_seeds, edge_energy=None,
-                                         edge_bonus=0.0):
+                                         edge_bonus=0.0,
+                                         palette=None,
+                                         brightness_bonus=0.0):
     """Select up to n_seeds component indices:
        1. Guarantee at least one component per palette color (the largest one).
        2. Fill the remaining budget with the largest components overall.
 
-    If edge_energy is provided and edge_bonus > 0, both passes rank by
-    (normalized area) + edge_bonus * (normalized edge energy) instead of
-    pure area, so edge-rich components are preferred when the budget is tight.
+    If edge_energy is provided and edge_bonus > 0, ranking adds
+    edge_bonus * (normalized edge energy).
+
+    If palette is provided and brightness_bonus > 0, each component's
+    brightness is taken directly from its palette color (components are
+    single-color by construction). Darker components get a higher score,
+    so brighter areas have a lower selection probability.
 
     Returns a sorted list of indices into the centroid/comp_pal lists.
     """
@@ -588,21 +601,28 @@ def _select_centroids_by_area_with_quota(comp_pal, comp_ids, comp_info,
     amax = areas.max()
     a_norm = areas / amax if amax > 0 else areas
 
+    score = a_norm.copy()
+
     if edge_energy is not None and edge_bonus > 0.0:
         ee = edge_energy[np.asarray(comp_ids)]
         emax = ee.max()
         e_norm = ee / emax if emax > 0 else ee
-        score = a_norm + edge_bonus * e_norm
-    else:
-        score = a_norm
+        score = score + edge_bonus * e_norm
+
+    if palette is not None and brightness_bonus > 0.0:
+        pal = np.array(comp_pal, dtype=np.int64)
+        colors = np.asarray(palette, dtype=np.float64)[pal]  # (m, 3)
+        # Perceptual-ish luma (Rec. 601)
+        luma = 0.299 * colors[:, 0] + 0.587 * colors[:, 1] + 0.114 * colors[:, 2]
+        lmax = luma.max()
+        l_norm = luma / lmax if lmax > 0 else luma
+        score = score + brightness_bonus * l_norm
 
     pal = np.array(comp_pal, dtype=np.int64)
 
     selected = set()
 
     # ---- Pass 1: one (largest-score) component per palette color ----
-    # The first time we see a palette index in descending-score order is that
-    # color's best component.
     order_desc = np.argsort(score)[::-1]
     seen_pal = set()
     for i in order_desc:
@@ -622,28 +642,26 @@ def _select_centroids_by_area_with_quota(comp_pal, comp_ids, comp_info,
             if i not in selected:
                 selected.add(i)
 
-    # Stable output order
     return sorted(selected)
 
-def knife_cut_cells(img_small, pal_indices, n_palette, w, h, n_seeds, rng,
-                    seed_from_edges=False, bridge_ratio=0.01,
-                    edge_weight=0.5, edge_bonus=0.5):
-    # Step 1: same-color connected components
+def knife_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, rng,
+                    bias_type, bridge_ratio=0.01,
+                    edge_weight=0.5, edge_bonus=0.5,
+                    brightness_bonus=0.5):
     bridge_r = int(round(max(w, h) * bridge_ratio))
     min_area = w * h / (n_seeds * n_palette)
     labels, comp_info = same_color_components(
         pal_indices, bridge_radius=bridge_r
     )
 
-    # Optional edge map (shared by representative placement, selection, cuts)
     edge_map = None
     edge_energy = None
+    seed_from_edges = bias_type == 'edges'
     if seed_from_edges:
         gray = np.array(img_small.convert("L"), dtype=np.float64)
         edge_map = _edge_map(gray)
         edge_energy = _component_edge_energy(comp_info, labels, edge_map)
 
-    # Step 2/3: use DT to find a centered representative point for each component
     centroids, comp_pal, comp_ids = component_representative_points_dt(
         labels, comp_info, min_area,
         edge_map=edge_map,
@@ -652,17 +670,16 @@ def knife_cut_cells(img_small, pal_indices, n_palette, w, h, n_seeds, rng,
     if not centroids:
         return []
 
-    # Step 4: if there are too many components, keep the largest by area,
-    #         guaranteeing at least one component per palette color.
     if len(centroids) > n_seeds:
         keep = _select_centroids_by_area_with_quota(
             comp_pal, comp_ids, comp_info, int(n_seeds),
             edge_energy=edge_energy,
             edge_bonus=edge_bonus if seed_from_edges else 0.0,
+            palette=palette,
+            brightness_bonus=brightness_bonus if bias_type == 'brightness' else 0.0,
         )
         centroids = [centroids[i] for i in keep]
 
-    # Step 5: Voronoi cut (edge-biased pair selection when edge_map is present)
     final_polys = centroid_cut_sparse(
         centroids, float(w), float(h), n_seeds, rng,
         edge_map=edge_map if seed_from_edges else None,
@@ -736,7 +753,9 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         pars.add_argument("--n_colors", type=int, default=12)
         pars.add_argument("--n_seeds", type=int, default=600)
         pars.add_argument("--stroke_width", type=float, default=2.0)
-        pars.add_argument("--seed_from_edges", type=inkex.Boolean, default=False)
+        pars.add_argument("--bias_type", type=str, default="none",
+            choices=["none", "edges", "brightness"],
+        )
         pars.add_argument("--random_seed", type=int, default=42)
         pars.add_argument("--max_dim", type=int, default=600)
 
@@ -819,39 +838,22 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         n_seeds = min(int(self.options.n_seeds), max(1, w * h // 100))
 
         if cell_shape == "triangles":
-            if self.options.seed_from_edges:
-                gray = np.array(img_small.convert("L"), dtype=np.float64)
-                seeds = edge_weighted_seeds(w, h, n_seeds, gray, rng=rng)
-            else:
-                seeds = grid_seeds(w, h, n_seeds, rng=rng)
+            seeds = generate_seeds(w, h, n_seeds, img_small, rng, bias_type=self.options.bias_type)
             polygons = triangle_cells(w, h, seeds)
             if not polygons:
                 inkex.errormsg("Triangulation produced no cells.")
                 return
-            dom_idx = dominant_palette_index_for_polygons(
-                polygons, pal_indices, n_palette, w, h
-            )
         elif cell_shape == "knife_cut":
             polygons = knife_cut_cells(
-                img_small, pal_indices, n_palette, w, h, n_seeds, rng,
-                seed_from_edges=self.options.seed_from_edges,
+                img_small, pal_indices, n_palette, palette, w, h, n_seeds, rng,
+                bias_type=self.options.bias_type
             )
             if not polygons:
                 inkex.errormsg("Knife-cut produced no cells.")
                 return
-
-            dom_idx = dominant_palette_index_for_polygons(
-                polygons, pal_indices, n_palette, w, h
-            )
         else:
             # Voronoi (original path)
-            if self.options.seed_from_edges:
-                gray = np.array(img_small.convert("L"), dtype=np.float64)
-                seeds = edge_weighted_seeds(w, h, n_seeds, gray, rng=rng)
-            else:
-                seeds = grid_seeds(w, h, n_seeds, rng=rng)
-
-            n_cells = len(seeds)
+            seeds = generate_seeds(w, h, n_seeds, img_small, rng, bias_type=self.options.bias_type)
 
             def _process(i):
                 poly = voronoi_cell(i, seeds, float(w), float(h), None)
@@ -864,15 +866,15 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
                 lo = np.min(poly, axis=0)
                 hi = np.max(poly, axis=0)
 
-                if (hi - lo).prod() < 4.0:
+                if np.prod(hi - lo) < 4.0:
                     return
                 return poly
 
-            polygons = [x for x in thread_pool.map(_process, range(n_cells)) if x is not None]
+            polygons = [x for x in thread_pool.map(_process, range(len(seeds))) if x is not None]
 
-            dom_idx = dominant_palette_index_for_polygons(
-                polygons, pal_indices, n_palette, w, h
-            )
+        dom_idx = dominant_palette_index_for_polygons(
+            polygons, pal_indices, n_palette, w, h
+        )
 
         # 5. Build SVG paths
         group = inkex.Group()
