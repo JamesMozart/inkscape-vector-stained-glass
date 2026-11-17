@@ -8,6 +8,8 @@ strokes between cells.
 ![Example output](example.png)
 **Slash Dimension (knife cut)**
 ![Example output](example_slash.png)
+**Flowers (larger number of seeds for better detail)**
+![Example output](example_flower.png)
 
 ## Features
 
@@ -15,6 +17,10 @@ strokes between cells.
   - `voronoi` — organic polygonal cells from Poisson-disk / edge-weighted / brightness-weighted seeds
   - `triangles` — Delaunay-based triangular cells with snapped boundary points
   - `knife_cut` — "Slash Dimension" style sparse perpendicular-bisector cuts between nearest same-color region centroids
+  - `flowers` — two-level radial Voronoi: first partition the image into
+  several large regions, then place ring-shaped "petal" seeds
+  inside each region (radius grows quadratically outward with angular
+  jitter) and re-run Voronoi to get flower-like radial cells.
 - Optional seed biasing:
   - `none` — uniform Poisson-disk sampling
   - `edges` — seeds concentrated on strong image edges
@@ -46,7 +52,7 @@ Restart Inkscape. Requires Inkscape 1.x (Python 3 + `inkex`).
 
 | Option         | Type   | Default   | Description                                                                                     |
 | -------------- | ------ | --------- | ----------------------------------------------------------------------------------------------- |
-| `cell_shape`   | choice | `voronoi` | Cell shape: `voronoi` (organic polygons), `triangles` (Delaunay), or `knife_cut` (sparse perpendicular-bisector cuts between nearest same-color region centroids). |
+| `cell_shape`   | choice | `voronoi` | Cell shape: `voronoi` (organic polygons), `triangles` (Delaunay), or `knife_cut` (sparse perpendicular-bisector cuts between nearest same-color region centroids), `flowers` (two-level radial Voronoi with petal-shaped seed rings). |
 | `n_colors`     | int    | `12`      | Palette size for color quantization (4–32).                                                     |
 | `n_seeds`      | int    | `600`     | Number of cells (seeds / target triangles). Capped internally at `w*h/100`.                      |
 | `stroke_width` | float  | `2.0`     | Outline stroke width between cells (0.5–10).                                                    |

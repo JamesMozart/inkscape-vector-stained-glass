@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import inkex
 import numpy as np
+import math
 import io
 import base64
 import os
@@ -9,103 +10,8 @@ from PIL import Image, ImageFilter
 from inkex.units import convert_unit
 
 from image_helper import pil_quantize_indices, same_color_components, component_representative_points_dt, thread_pool
-
-# ---------- Geometry helpers ----------
-
-def clip_polygon_halfplane(poly, a, b, c):
-    """Clip a convex polygon against a*x + b*y + c <= 0 (Sutherland-Hodgman)."""
-    poly = np.asarray(poly, dtype=float)
-    n = len(poly)
-    if n == 0:
-        return np.empty((0, 2), dtype=float)
-
-    ab = np.array([a, b], dtype=float)
-    dist = poly @ ab + c
-    inside = dist <= 1e-9
-    # skip fully inside or outside
-    inside_size = inside.sum()
-    if inside_size == n:
-        return poly
-    elif inside_size == 0:
-        return np.empty((0, 2), dtype=float)
-    prev_inside = np.roll(inside, 1)
-
-    def intersect(p1, p2):
-        d1 = p1 @ ab + c
-        d2 = p2 @ ab + c
-        denom = d1 - d2
-        if abs(denom) < 1e-12:
-            return p1
-        t = d1 / denom
-        return p1 + t * (p2 - p1)
-
-    out = []
-    prev = poly[-1]
-    for i in range(n):
-        cur = poly[i]
-        if inside[i]:
-            if not prev_inside[i]:
-                out.append(intersect(prev, cur))
-            out.append(cur)
-        elif prev_inside[i]:
-            out.append(intersect(prev, cur))
-        prev = cur
-    return np.asarray(out, dtype=float) if out else np.empty((0, 2), dtype=float)
-
-
-def clip_polygon_rect(poly, w, h):
-    """Clip a convex polygon against the rectangle [0,w]x[0,h]."""
-    poly = clip_polygon_halfplane(poly, -1.0, 0.0, 0.0)   # x >= 0
-    if len(poly) < 3:
-        return []
-    poly = clip_polygon_halfplane(poly, 1.0, 0.0, -w)       # x <= w
-    if len(poly) < 3:
-        return []
-    poly = clip_polygon_halfplane(poly, 0.0, -1.0, 0.0)    # y >= 0
-    if len(poly) < 3:
-        return []
-    poly = clip_polygon_halfplane(poly, 0.0, 1.0, -h)       # y <= h
-    return poly
-
-
-def solve_linear_abc(pts1, pts2):
-    return np.column_stack([
-        2.0 * (pts1 - pts2),
-        (pts2 * pts2 - pts1 * pts1).sum(axis=1)
-    ])
-
-
-def voronoi_cell(i, seeds, rect_w, rect_h, neighbors_idx=None):
-    """Compute Voronoi cell of seed i, optionally only clipping against neighbors."""
-    poly = [(0.0, 0.0), (rect_w, 0.0), (rect_w, rect_h), (0.0, rect_h)]
-    seedi = seeds[i]
-
-    if neighbors_idx is not None:
-        seeds = seeds[neighbors_idx]
-    else:
-        mask = np.ones(len(seeds), dtype=bool)
-        mask[i] = False
-        seeds = seeds[mask]
-
-    abc = solve_linear_abc(seeds, seedi)
-
-    for (a, b, c) in abc:
-        poly = clip_polygon_halfplane(poly, a, b, c)
-        if len(poly) < 3:
-            return None
-    return poly
-
-
-def simplify_poly(poly, eps=0.05):
-    """Remove near-duplicate consecutive vertices from a polygon."""
-    if len(poly) < 3:
-        return poly
-    poly_diff = np.maximum(
-        np.abs(np.roll(poly, -1) - poly).sum(axis=1),
-        np.abs(np.roll(poly, 1) - poly).sum(axis=1)
-    )
-    idx = np.flatnonzero(poly_diff > eps)
-    return poly[idx]
+from geometry_helper import clip_polygon_halfplane, clip_polygon_rect, solve_linear_abc, voronoi_cell, simplify_poly, snap_points_to_rect,\
+    dedupe_points, ray_polygon_intersections, polygon_area, polygon_centroid
 
 
 # ---------- Bowyer-Watson Delaunay triangulation (numpy only) ----------
@@ -195,39 +101,6 @@ def delaunay_triangulate(points):
     return result
 
 
-def _snap_points_to_rect(pts, w, h, snap_dist):
-    """Snap points closer than snap_dist to a rectangle edge onto that edge.
-
-    Returns a new snapped array (does not modify the original).
-    """
-    out = pts.copy()
-    if len(out) == 0:
-        return out
-
-    # Distances to the four edges
-    d_left = out[:, 0]
-    d_right = w - out[:, 0]
-    d_bottom = out[:, 1]
-    d_top = h - out[:, 1]
-
-    # Nearest edge for each point
-    dists = np.stack([d_left, d_right, d_bottom, d_top], axis=1)
-    nearest = np.argmin(dists, axis=1)
-    min_d = dists[np.arange(len(out)), nearest]
-
-    snap_mask = min_d < snap_dist
-    # 0=left, 1=right, 2=bottom, 3=top
-    out[snap_mask & (nearest == 0), 0] = 0.0
-    out[snap_mask & (nearest == 1), 0] = w
-    out[snap_mask & (nearest == 2), 1] = 0.0
-    out[snap_mask & (nearest == 3), 1] = h
-
-    # Clip to rectangle after snapping to guard against floating-point overshoot
-    out[:, 0] = np.clip(out[:, 0], 0.0, w)
-    out[:, 1] = np.clip(out[:, 1], 0.0, h)
-    return out
-
-
 def _boundary_points(w, h, spacing):
     """Add points along the four rectangle edges at the given spacing (including corners, no duplicates)."""
     if spacing <= 0:
@@ -250,22 +123,6 @@ def _boundary_points(w, h, spacing):
         pts.append((0.0, y))
         pts.append((w, y))
     return np.array(pts, dtype=np.float64)
-
-
-def _dedupe_points(pts, eps=1e-6):
-    """Remove near-duplicate points (quantize to an eps grid, then check one by one)."""
-    if len(pts) == 0:
-        return pts
-    # Quantize to an eps grid, deduplicate via a dict, keep first occurrence
-    keys = np.round(pts / eps).astype(np.int64)
-    seen = {}
-    keep = []
-    for i, k in enumerate(map(tuple, keys)):
-        if k not in seen:
-            seen[k] = i
-            keep.append(i)
-    return pts[np.array(keep, dtype=np.int64)]
-
 
 def triangle_cells(w, h, pts, snap_ratio=0.6, boundary_spacing=None):
     """Generate triangle cells covering [0,w]x[0,h].
@@ -303,7 +160,7 @@ def triangle_cells(w, h, pts, snap_ratio=0.6, boundary_spacing=None):
 
     # --- NEW: snap near-boundary points onto the rectangle edges ---
     snap_dist = snap_ratio * min(step_x, step_y)
-    pts = _snap_points_to_rect(pts, w, h, snap_dist)
+    pts = snap_points_to_rect(pts, w, h, snap_dist)
 
     # --- NEW: add uniformly spaced boundary points ---
     if boundary_spacing is None:
@@ -328,7 +185,7 @@ def triangle_cells(w, h, pts, snap_ratio=0.6, boundary_spacing=None):
     pts = np.vstack([pts, bpts])
 
     # Deduplicate (corners / snapped points may coincide with boundary points)
-    pts = _dedupe_points(pts, eps=1e-6)
+    pts = dedupe_points(pts, eps=1e-6)
 
     # Final safety clip
     pts[:, 0] = np.clip(pts[:, 0], 0.0, w)
@@ -670,7 +527,7 @@ def knife_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, r
     if not centroids:
         return []
 
-    if len(centroids) > n_seeds:
+    if len(centroids) > 1:
         keep = _select_centroids_by_area_with_quota(
             comp_pal, comp_ids, comp_info, int(n_seeds),
             edge_energy=edge_energy,
@@ -689,6 +546,65 @@ def knife_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, r
     return final_polys
 
 
+# flower cut
+def flower_seeds(center, poly, n_petals=12, seeds_per_petal=6, min_radius=2.0, rng=None):
+    if rng is None:
+        rng = np.random.default_rng(0)
+    C = np.asarray(center, dtype=np.float64)
+    P = np.asarray(poly, dtype=np.float64)
+    seeds = [C]
+    for s in range(1, seeds_per_petal + 1):
+        n_ring_petals = max(3, n_petals - seeds_per_petal // 2 + s) # grow out with 1 more pedal per step
+        for i in range(n_ring_petals):
+            th = 2*np.pi * (i / n_petals + rng.normal(0, 0.5 / n_ring_petals))  # jitter
+            r_frac = (s / seeds_per_petal) ** 2
+            _, hit = ray_polygon_intersections(C, np.array([[np.cos(th), np.sin(th)]]), P)
+            rmax = np.linalg.norm(hit[0] - C) if np.isfinite(hit[0]).all() else 0.5
+            r = rmax * r_frac * (0.9 + 0.2 * rng.random())
+            if r > min_radius:
+                seeds.append(C + r * np.array([np.cos(th), np.sin(th)]))
+    return np.array(seeds)
+
+def flowers_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, rng,
+                    bias_type):
+    seeds = generate_seeds(w, h, rng.integers(1, 5, endpoint=True), img_small, rng, bias_type)
+    rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
+
+    def _process_voronoi(args):
+        i, seeds, rect = args
+        poly = voronoi_cell(i, seeds, rect, None)
+        if poly is None or len(poly) < 3:
+            return
+        poly = simplify_poly(poly)
+        if len(poly) < 3:
+            return
+
+        lo = np.min(poly, axis=0)
+        hi = np.max(poly, axis=0)
+
+        if np.prod(hi - lo) < 4.0:
+            return
+        return poly
+
+    if len(seeds) <= 1:
+        polys = [rect]
+    else:
+        polys = [x for x in thread_pool.map(_process_voronoi, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
+    areas = [polygon_area(x) for x in polys]
+    n_sub_seeds = np.ceil(areas / sum(areas) * n_seeds).astype(np.int32)
+    final_polys = []
+
+    def _process_poly(args):
+        poly, n_sub_seedi = args
+        n_petals = 12 if n_sub_seedi > 12 else math.ceil(n_sub_seedi / 2)
+        seeds_per_petal = math.ceil(n_sub_seedi / n_petals)
+        sub_seeds = flower_seeds(polygon_centroid(poly), poly, n_petals=n_petals, seeds_per_petal=seeds_per_petal)
+        return [voronoi_cell(j, sub_seeds, poly, None) for j in range(len(sub_seeds))]
+            
+    for x in thread_pool.map(_process_poly, list(zip(polys, n_sub_seeds))):
+        final_polys.extend([p for p in x if p is not None])
+    return final_polys
+
 # ---------- Triangle-based per-cell sampling ----------
 
 def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
@@ -697,16 +613,15 @@ def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
     We rasterize each polygon separately using a simple even-odd point-in-polygon
     test on a per-polygon bounding box. For a few hundred cells this is fine.
     """
-    h_img, w_img = pal_indices.shape
-    flat_pal = pal_indices.ravel()
-
-    def _process(poly):
-        xs = [p[0] for p in poly]
-        ys = [p[1] for p in poly]
-        x0 = max(0, int(np.floor(min(xs))))
-        x1 = min(w_img, int(np.ceil(max(xs))) + 1)
-        y0 = max(0, int(np.floor(min(ys))))
-        y1 = min(h_img, int(np.ceil(max(ys))) + 1)
+    def _process(args):
+        pal_indices, poly = args
+        h_img, w_img = pal_indices.shape
+        xs = poly[:,0]
+        ys = poly[:,1]
+        x0 = max(0, int(np.floor(np.min(xs))))
+        x1 = min(w_img, int(np.ceil(np.max(xs))) + 1)
+        y0 = max(0, int(np.floor(np.min(ys))))
+        y1 = min(h_img, int(np.ceil(np.max(ys))) + 1)
         if x1 <= x0 or y1 <= y0:
             return 0
         # Pixel centers in bbox
@@ -728,12 +643,11 @@ def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
         local_y, local_x = np.divmod(idx, (x1 - x0))
         glob_y = local_y + y0
         glob_x = local_x + x0
-        flat = glob_y * w_img + glob_x
-        vals = flat_pal[flat]
+        vals = pal_indices[glob_y, glob_x]
         counts = np.bincount(vals, minlength=n_palette)
         return int(np.argmax(counts))
 
-    results = list(thread_pool.map(_process, polygons))
+    results = list(thread_pool.map(_process, [(pal_indices, poly) for poly in polygons]))
     return np.array(results, dtype=np.int32)
 
 
@@ -747,8 +661,8 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         )
         pars.add_argument(
             "--cell_shape", type=str, default="voronoi",
-            choices=["voronoi", "triangles", "knife_cut"],
-            help="Cell shape: voronoi (default) or triangles (Delaunay-based) or knife_cut",
+            choices=["voronoi", "triangles", "knife_cut", "flowers"],
+            help="Cell shape: voronoi (default) or triangles (Delaunay-based) or knife_cut or flowers",
         )
         pars.add_argument("--n_colors", type=int, default=12)
         pars.add_argument("--n_seeds", type=int, default=600)
@@ -851,12 +765,22 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
             if not polygons:
                 inkex.errormsg("Knife-cut produced no cells.")
                 return
+        elif cell_shape == "flowers":
+            polygons = flowers_cut_cells(
+                img_small, pal_indices, n_palette, palette, w, h, n_seeds, rng,
+                bias_type=self.options.bias_type
+            )
+            if not polygons:
+                inkex.errormsg("Flowers-cut produced no cells.")
+                return
         else:
             # Voronoi (original path)
             seeds = generate_seeds(w, h, n_seeds, img_small, rng, bias_type=self.options.bias_type)
+            rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
 
-            def _process(i):
-                poly = voronoi_cell(i, seeds, float(w), float(h), None)
+            def _voronoi_process(args):
+                i, seeds, rect = args
+                poly = voronoi_cell(i, seeds, rect, None)
                 if poly is None or len(poly) < 3:
                     return
                 poly = simplify_poly(poly)
@@ -870,7 +794,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
                     return
                 return poly
 
-            polygons = [x for x in thread_pool.map(_process, range(len(seeds))) if x is not None]
+            polygons = [x for x in thread_pool.map(_voronoi_process, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
 
         dom_idx = dominant_palette_index_for_polygons(
             polygons, pal_indices, n_palette, w, h
