@@ -312,24 +312,6 @@ def _component_edge_energy(comp_info, labels, edge_map):
     out[nz] = sums[nz] / counts[nz]
     return out
 
-
-# ---------- Rasterization of all Voronoi regions at once ----------
-
-def voronoi_region_labels(seeds, w, h):
-    """Return an (h, w) int32 array of nearest-seed index for every pixel."""
-    ys, xs = np.mgrid[0:h, 0:w]
-    pts = np.column_stack([xs.ravel() + 0.5, ys.ravel() + 0.5])
-    seeds_arr = np.asarray(seeds, dtype=np.float64)
-    out = np.empty(len(pts), dtype=np.int32)
-    chunk = 65536
-    for s in range(0, len(pts), chunk):
-        e = min(s + chunk, len(pts))
-        sub = pts[s:e]
-        d = ((sub[:, None, :] - seeds_arr[None, :, :]) ** 2).sum(axis=2)
-        out[s:e] = np.argmin(d, axis=1)
-    return out.reshape(h, w)
-
-
 # ---------- A3: dominant palette index per cell (bincount + argmax) ----------
 
 def dominant_palette_index(region_labels, pal_indices, n_cells, n_palette):
@@ -501,41 +483,47 @@ def _select_centroids_by_area_with_quota(comp_pal, comp_ids, comp_info,
 
     return sorted(selected)
 
-def knife_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, rng,
+def knife_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                     bias_type, bridge_ratio=0.01,
                     edge_weight=0.5, edge_bonus=0.5,
                     brightness_bonus=0.5):
-    bridge_r = int(round(max(w, h) * bridge_ratio))
-    min_area = w * h / (n_seeds * n_palette)
-    labels, comp_info = same_color_components(
-        pal_indices, bridge_radius=bridge_r
-    )
-
-    edge_map = None
-    edge_energy = None
     seed_from_edges = bias_type == 'edges'
+    edge_map = None
+    gray = None
     if seed_from_edges:
         gray = np.array(img_small.convert("L"), dtype=np.float64)
         edge_map = _edge_map(gray)
-        edge_energy = _component_edge_energy(comp_info, labels, edge_map)
 
-    centroids, comp_pal, comp_ids = component_representative_points_dt(
-        labels, comp_info, min_area,
-        edge_map=edge_map,
-        edge_weight=edge_weight if seed_from_edges else 0.0,
-    )
-    if not centroids:
-        return []
-
-    if len(centroids) > 1:
-        keep = _select_centroids_by_area_with_quota(
-            comp_pal, comp_ids, comp_info, int(n_seeds),
-            edge_energy=edge_energy,
-            edge_bonus=edge_bonus if seed_from_edges else 0.0,
-            palette=palette,
-            brightness_bonus=brightness_bonus if bias_type == 'brightness' else 0.0,
+    if len(manual_seeds) == 0:
+        bridge_r = int(round(max(w, h) * bridge_ratio))
+        min_area = w * h / (n_seeds * n_palette)
+        labels, comp_info = same_color_components(
+            pal_indices, bridge_radius=bridge_r
         )
-        centroids = [centroids[i] for i in keep]
+
+        edge_energy = None
+        if seed_from_edges:
+            edge_energy = _component_edge_energy(comp_info, labels, edge_map)
+
+        centroids, comp_pal, comp_ids = component_representative_points_dt(
+            labels, comp_info, min_area,
+            edge_map=edge_map,
+            edge_weight=edge_weight if seed_from_edges else 0.0,
+        )
+        if not centroids:
+            return []
+
+        if len(centroids) > 1:
+            keep = _select_centroids_by_area_with_quota(
+                comp_pal, comp_ids, comp_info, int(n_seeds),
+                edge_energy=edge_energy,
+                edge_bonus=edge_bonus if seed_from_edges else 0.0,
+                palette=palette,
+                brightness_bonus=brightness_bonus if bias_type == 'brightness' else 0.0,
+            )
+            centroids = [centroids[i] for i in keep]
+    else:
+        centroids = manual_seeds
 
     final_polys = centroid_cut_sparse(
         centroids, float(w), float(h), n_seeds, rng,
@@ -565,12 +553,101 @@ def flower_seeds(center, poly, n_petals=12, seeds_per_petal=6, min_radius=2.0, r
                 seeds.append(C + r * np.array([np.cos(th), np.sin(th)]))
     return np.array(seeds)
 
-def flowers_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, rng,
+def flowers_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                     bias_type):
-    seeds = generate_seeds(w, h, rng.integers(1, 5, endpoint=True), img_small, rng, bias_type)
+    is_manual_seed = len(manual_seeds) > 0
+    seeds = manual_seeds if is_manual_seed else generate_seeds(w, h, rng.integers(1, 5, endpoint=True), img_small, rng, bias_type)
     rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
 
     def _process_voronoi(args):
+        i, seeds, is_manual_seed, rect = args
+        poly = voronoi_cell(i, seeds, rect, None)
+        if poly is None or len(poly) < 3:
+            return
+        poly = simplify_poly(poly)
+        if len(poly) < 3:
+            return
+
+        lo = np.min(poly, axis=0)
+        hi = np.max(poly, axis=0)
+
+        if np.prod(hi - lo) < 4.0:
+            return
+
+        # use manual seed as flower center if provided
+        centroid = seeds[i] if is_manual_seed else polygon_centroid(poly)
+
+        return poly, centroid, polygon_area(poly)
+
+    if len(seeds) == 0:
+        seeds = np.round((w / 2, h / 2))
+    
+    if len(seeds) <= 1:
+        poly_infos = [[rect, seeds[0], w * h]]
+    else:
+        poly_infos = [x for x in thread_pool.map(_process_voronoi, [(i, seeds, is_manual_seed, rect) for i in range(len(seeds))]) if x is not None]
+    areas = np.asarray([x[2] for x in poly_infos])
+    n_sub_seeds = np.ceil(areas / areas.sum() * n_seeds).astype(np.int32)
+    final_polys = []
+
+    def _process_poly(args):
+        poly_info, n_sub_seedi = args
+        poly, centroid, area = poly_info
+        n_petals = 12 if n_sub_seedi > 12 else math.ceil(n_sub_seedi / 2)
+        seeds_per_petal = math.ceil(n_sub_seedi / n_petals)
+        sub_seeds = flower_seeds(centroid, poly, n_petals=n_petals, seeds_per_petal=seeds_per_petal)
+        return [voronoi_cell(j, sub_seeds, poly, None) for j in range(len(sub_seeds))]
+            
+    for x in thread_pool.map(_process_poly, list(zip(poly_infos, n_sub_seeds))):
+        final_polys.extend([p for p in x if p is not None])
+    return final_polys
+
+
+def flowers_soft_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                    bias_type):
+    is_manual_seed = len(manual_seeds) > 0
+    seeds = manual_seeds if is_manual_seed else generate_seeds(w, h, rng.integers(1, 5, endpoint=True), img_small, rng, bias_type)
+    rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
+
+    def _process_voronoi(args):
+        i, seeds, is_manual_seed, rect = args
+        poly = voronoi_cell(i, seeds, rect, None)
+        if poly is None or len(poly) < 3:
+            return
+        poly = simplify_poly(poly)
+        if len(poly) < 3:
+            return
+
+        lo = np.min(poly, axis=0)
+        hi = np.max(poly, axis=0)
+
+        if np.prod(hi - lo) < 4.0:
+            return
+
+        # use manual seed as flower center if provided
+        centroid = seeds[i] if is_manual_seed else polygon_centroid(poly)
+
+        return poly, centroid, polygon_area(poly)
+
+    if len(seeds) == 0:
+        seeds = np.round((w / 2, h / 2))
+    
+    if len(seeds) <= 1:
+        poly_infos = [[rect, seeds[0], w * h]]
+    else:
+        poly_infos = [x for x in thread_pool.map(_process_voronoi, [(i, seeds, is_manual_seed, rect) for i in range(len(seeds))]) if x is not None]
+    areas = np.asarray([x[2] for x in poly_infos])
+    n_sub_seeds = np.ceil(areas / areas.sum() * n_seeds).astype(np.int32)
+
+    final_seeds = []
+    for (poly, centroid, area), n_sub_seedi in zip(poly_infos, n_sub_seeds):
+        n_petals = 12 if n_sub_seedi > 12 else math.ceil(n_sub_seedi / 2)
+        seeds_per_petal = math.ceil(n_sub_seedi / n_petals)
+        final_seeds.append(flower_seeds(centroid, poly, n_petals=n_petals, seeds_per_petal=seeds_per_petal))
+
+    final_seeds = dedupe_points(np.concatenate(final_seeds), eps=2)
+    
+    def _process_poly(args):
         i, seeds, rect = args
         poly = voronoi_cell(i, seeds, rect, None)
         if poly is None or len(poly) < 3:
@@ -584,26 +661,17 @@ def flowers_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds,
 
         if np.prod(hi - lo) < 4.0:
             return
+        
         return poly
+        
+    final_polys = [x for x in thread_pool.map(_process_poly, [(i, final_seeds, rect) for i in range(len(final_seeds))]) if x is not None]
 
-    if len(seeds) <= 1:
-        polys = [rect]
-    else:
-        polys = [x for x in thread_pool.map(_process_voronoi, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
-    areas = [polygon_area(x) for x in polys]
-    n_sub_seeds = np.ceil(areas / sum(areas) * n_seeds).astype(np.int32)
-    final_polys = []
-
-    def _process_poly(args):
-        poly, n_sub_seedi = args
-        n_petals = 12 if n_sub_seedi > 12 else math.ceil(n_sub_seedi / 2)
-        seeds_per_petal = math.ceil(n_sub_seedi / n_petals)
-        sub_seeds = flower_seeds(polygon_centroid(poly), poly, n_petals=n_petals, seeds_per_petal=seeds_per_petal)
-        return [voronoi_cell(j, sub_seeds, poly, None) for j in range(len(sub_seeds))]
-            
-    for x in thread_pool.map(_process_poly, list(zip(polys, n_sub_seeds))):
-        final_polys.extend([p for p in x if p is not None])
     return final_polys
+
+
+# water flow
+# todo
+
 
 # ---------- Triangle-based per-cell sampling ----------
 
@@ -650,7 +718,6 @@ def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
     results = list(thread_pool.map(_process, [(pal_indices, poly) for poly in polygons]))
     return np.array(results, dtype=np.int32)
 
-
 # ---------- Inkscape extension ----------
 
 class VectorStainedGlassExtension(inkex.EffectExtension):
@@ -661,7 +728,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         )
         pars.add_argument(
             "--cell_shape", type=str, default="voronoi",
-            choices=["voronoi", "triangles", "knife_cut", "flowers"],
+            choices=["voronoi", "triangles", "knife_cut", "flowers", "flowers_soft"],
             help="Cell shape: voronoi (default) or triangles (Delaunay-based) or knife_cut or flowers",
         )
         pars.add_argument("--n_colors", type=int, default=12)
@@ -704,22 +771,26 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         return x, y, w, h, transform
 
     def effect(self):
-        selected = [
-            el for el in self.svg.selection.values()
-            if isinstance(el, inkex.Image)
-        ]
-        if not selected:
+        image = None
+        manual_seeds = []
+        for el in self.svg.selection.values():
+            if image is None and isinstance(el, inkex.Image):
+                image = el
+            else:
+                # use non image elements as manual seeds, replacing random generated seed
+                manual_seeds.append([int(convert_unit(str(value), "px")) for value in el.bounding_box().center])
+       
+        if image is None:
             inkex.errormsg("Please select a bitmap image first.")
             return
-
-        image = selected[0]
+        
         try:
             img = self._load_image(image)
             img_x, img_y, img_w, img_h, img_transform = self._image_geometry(image)
         except Exception as e:
             inkex.errormsg(f"Cannot read image: {e}")
             return
-      
+     
         orig_w, orig_h = img.size
         max_dim = self.options.max_dim
         if max(orig_w, orig_h) > max_dim:
@@ -729,6 +800,11 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         else:
             w, h = orig_w, orig_h
             img_small = img
+
+        if len(manual_seeds) > 0:
+            manual_seeds = np.asarray(manual_seeds) - (img_x, img_y)
+            mask = (manual_seeds[:,0] >= 0) & (manual_seeds[:,0] < img_w) & (manual_seeds[:,1] >= 0) & (manual_seeds[:,1] < img_h)
+            manual_seeds = np.round(manual_seeds[mask] / img_w * w)
 
         blur_size = max(0, self.options.blur_size)
         if blur_size > 0:
@@ -752,14 +828,14 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         n_seeds = min(int(self.options.n_seeds), max(1, w * h // 100))
 
         if cell_shape == "triangles":
-            seeds = generate_seeds(w, h, n_seeds, img_small, rng, bias_type=self.options.bias_type)
+            seeds = manual_seeds if len(manual_seeds) > 0 else generate_seeds(w, h, n_seeds, img_small, rng, bias_type=self.options.bias_type)
             polygons = triangle_cells(w, h, seeds)
             if not polygons:
                 inkex.errormsg("Triangulation produced no cells.")
                 return
         elif cell_shape == "knife_cut":
             polygons = knife_cut_cells(
-                img_small, pal_indices, n_palette, palette, w, h, n_seeds, rng,
+                img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                 bias_type=self.options.bias_type
             )
             if not polygons:
@@ -767,7 +843,15 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
                 return
         elif cell_shape == "flowers":
             polygons = flowers_cut_cells(
-                img_small, pal_indices, n_palette, palette, w, h, n_seeds, rng,
+                img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                bias_type=self.options.bias_type
+            )
+            if not polygons:
+                inkex.errormsg("Flowers-cut produced no cells.")
+                return
+        elif cell_shape == "flowers_soft":
+            polygons = flowers_soft_cut_cells(
+                img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                 bias_type=self.options.bias_type
             )
             if not polygons:
@@ -775,7 +859,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
                 return
         else:
             # Voronoi (original path)
-            seeds = generate_seeds(w, h, n_seeds, img_small, rng, bias_type=self.options.bias_type)
+            seeds = manual_seeds if len(manual_seeds) > 0 else  generate_seeds(w, h, n_seeds, img_small, rng, bias_type=self.options.bias_type)
             rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
 
             def _voronoi_process(args):

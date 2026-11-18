@@ -3,12 +3,14 @@
     <name>Vector Stained Glass</name>
     <id>com.example.inkscapevectorstainedglass</id>
     <label>Select a bitmap image on the canvas first, then apply.</label>
+    <label>If additional non-image elements are selected, their centers are used as seeds instead of random generated seeds (best for Cell shape: Flowers).</label>
     <param name="cell_shape" type="optiongroup" appearance="combo"
        gui-text="Cell shape:">
         <option value="voronoi">Voronoi (cracked glass)</option>
         <option value="triangles">Triangles (Delaunay)</option>
-        <option value="knife_cut">Knife cut</option>
+        <option value="knife_cut">Knife cut (Slash Dimension)</option>
         <option value="flowers">Flowers</option>
+        <option value="flowers_soft">Flowers (soft edges)</option>
     </param>
     <param name="n_colors" type="int" min="4" max="32" gui-text="Palette colors">12</param>
     <param name="n_seeds" type="int" min="4" max="3000" gui-text="Number of seeds">600</param>
