@@ -100,24 +100,22 @@ def voronoi_cell(i, seeds, poly, neighbors_idx=None, eps=1e-9):
     # Max radius: furthest polygon vertex from seed_i.
     # Any half-plane whose bisector lies farther than this cannot cut.
     def max_radius(p, s):
-        return np.sqrt(((poly - seedi) ** 2).sum(axis=1)).max()
+        return np.sqrt(((p - s) ** 2).sum(axis=1)).max()
 
     r = max_radius(poly, seedi)
 
-    for j in range(len(other)):
+    for oj, dj in zip(other, d):
         # If the perpendicular bisector is at distance d/2 from seed_i
         # and exceeds the polygon's circumradius around seed_i,
         # the half-plane cannot clip the polygon.
-        if d[j] * 0.5 > r + eps:
+        if dj * 0.5 > r + eps:
             break  # sorted by distance: all remaining are even farther
 
-        oj = other[j]
         # Half-plane: points closer to seed_i than to oj
         # |p - seedi|^2 <= |p - oj|^2
         # 2*(oj - seedi)·p <= |oj|^2 - |seedi|^2
-        a = 2.0 * (oj[0] - seedi[0])
-        b = 2.0 * (oj[1] - seedi[1])
-        c = (seedi[0] ** 2 + seedi[1] ** 2) - (oj[0] ** 2 + oj[1] ** 2)
+        a, b = 2.0 * (oj - seedi)
+        c = (seedi ** 2 - oj ** 2).sum()
         # a*x + b*y + c <= 0
 
         new_poly = clip_polygon_halfplane(poly, a, b, c)
@@ -126,10 +124,9 @@ def voronoi_cell(i, seeds, poly, neighbors_idx=None, eps=1e-9):
         # Did it actually change anything? If vertex count & coords identical,
         # skip radius recompute (no shrink).
         if len(new_poly) != len(poly) or not np.allclose(new_poly, poly, atol=1e-12):
-            poly = new_poly
             r = max_radius(poly, seedi)
-        else:
-            poly = new_poly
+        
+        poly = new_poly
     return poly
 
 

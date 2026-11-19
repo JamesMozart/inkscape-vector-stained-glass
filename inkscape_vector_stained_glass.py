@@ -188,8 +188,7 @@ def triangle_cells(w, h, pts, snap_ratio=0.6, boundary_spacing=None):
     pts = dedupe_points(pts, eps=1e-6)
 
     # Final safety clip
-    pts[:, 0] = np.clip(pts[:, 0], 0.0, w)
-    pts[:, 1] = np.clip(pts[:, 1], 0.0, h)
+    pts = np.clip(pts, (0.0, 0.0), (w, h), out=pts)
 
     tris = delaunay_triangulate(pts)
     cells = []
@@ -342,15 +341,17 @@ def _component_edge_energy(comp_info, labels, edge_map):
     out[nz] = sums[nz] / counts[nz]
     return out
 
-def _pair_edge_score(pts, i, j, edge_map):
+def _pair_edge_score(pts, pairs, edge_map):
     """Average edge strength sampled at both endpoints of pair (i, j)."""
     if edge_map is None:
         return 0.0
     h, w = edge_map.shape
-    xi = int(np.clip(pts[i][0], 0, w - 1))
-    yi = int(np.clip(pts[i][1], 0, h - 1))
-    xj = int(np.clip(pts[j][0], 0, w - 1))
-    yj = int(np.clip(pts[j][1], 0, h - 1))
+    ptsi = pts[pairs[:,0]]
+    ptsj = pts[pairs[:,1]]
+    xi = np.clip(ptsi[:,0], 0, w - 1).astype(np.int32)
+    yi = np.clip(ptsi[:,1], 0, h - 1).astype(np.int32)
+    xj = np.clip(ptsj[:,0], 0, w - 1).astype(np.int32)
+    yj = np.clip(ptsj[:,1], 0, h - 1).astype(np.int32)
     return 0.5 * (edge_map[yi, xi] + edge_map[yj, xj])
 
 def centroid_cut_sparse(centroids, w, h, n_seeds, rng, edge_map=None):
@@ -380,10 +381,7 @@ def centroid_cut_sparse(centroids, w, h, n_seeds, rng, edge_map=None):
     k = max(1, n // 2)
     if len(pairs) > k:
         if edge_map is not None:
-            scores = np.array(
-                [_pair_edge_score(pts, i, j, edge_map) for (i, j) in pairs],
-                dtype=np.float64,
-            )
+            scores = _pair_edge_score(pts, pairs, edge_map)
             # Convert scores to sampling weights; add a small floor so that
             # non-edge pairs still have a chance (keeps coverage reasonable).
             weights = scores + 0.05
@@ -604,7 +602,7 @@ def flowers_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds,
 
 
 def flowers_soft_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
-                    bias_type):
+                    bias_type, warp_polygons=False):
     is_manual_seed = len(manual_seeds) > 0
     seeds = manual_seeds if is_manual_seed else generate_seeds(w, h, rng.integers(1, 5, endpoint=True), img_small, rng, bias_type)
     rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
@@ -666,11 +664,106 @@ def flowers_soft_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_s
         
     final_polys = [x for x in thread_pool.map(_process_poly, [(i, final_seeds, rect) for i in range(len(final_seeds))]) if x is not None]
 
+    if warp_polygons:
+        centers = generate_seeds(w, h, rng.integers(1, 3, endpoint=True), img_small, rng, bias_type)
+        
+        lengths = [len(poly) for poly in final_polys]
+        merged = np.concatenate(final_polys)
+        merged = warp_points(merged, centers, w, h, rng)
+        final_polys = np.split(merged, np.cumsum(lengths)[:-1])
+
     return final_polys
 
 
-# water flow
-# todo
+# river
+def swirl_velocity(p, w, h, centers, strengths):
+    """Sum of point vortices -> tangential velocity field.
+    """
+    v = np.zeros_like(p, dtype=np.float64)
+    rwh = np.sqrt(w * h)
+    for c_n, g in zip(centers, strengths):
+        c = c_n * (w, h)
+        d = p - c
+        r = np.hypot(d[:,0], d[:,1])
+        # u = d / r[:,None]
+        # v[:,0] += -g * rwh * u[:,1]
+        # v[:,1] += g * rwh * u[:,0]
+        theta = np.zeros_like(r, dtype=np.float64)
+        mask = r > 1e-6
+        theta[mask] = g * rwh / r[mask]
+        c, s = np.cos(theta), np.sin(theta)
+        x, y = d[:, 0], d[:, 1]
+        d_next = np.column_stack([x * c - y * s, x * s + y * c])
+        v += d_next - d
+    return v
+
+
+def warp_points(P, p_centers, w, h, rng,
+               n_steps=10):
+    """Warp points with  a vortex velocity field.
+    """
+    if len(P) == 0:
+        return P
+
+    # add some low power jittering centers
+    centers_low = grid_seeds(w, h, len(p_centers))
+    centers = np.vstack([p_centers, centers_low]) / (w, h)
+    n_centers = len(centers)
+    signs = np.where(np.arange(n_centers) % 2 == 0, 1.0, -1.0)
+    # high powers + low powers
+    strengths = signs * np.append(rng.uniform(0.10, 0.25, size=n_centers // 2), rng.uniform(0.02, 0.05, size=n_centers // 2))
+
+    # Integrate the flow field in n_steps small Euler steps
+    step_strengths = strengths / n_steps
+    for _ in range(n_steps):
+        v = swirl_velocity(P, w, h, centers, step_strengths)
+        # damping on borders
+        weight = np.min((1 - np.cos(P / (w, h) * 2 * np.pi)) / 2, axis=1)
+        np.clip(weight, 0.0, 1.0, out=weight)
+        # weight = np.min(1 - np.abs(P / (w, h) * 2 - 1) ** 0.5, axis=1)
+
+        P += v * weight[:,None]
+        np.clip(P, [0.0, 0.0], [w, h], out=P)
+    return P
+
+
+
+def river_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                    bias_type):
+    # double n_seeds then kick out poly out of range after wrap
+    rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
+    seeds = generate_seeds(w, h, n_seeds, img_small, rng, bias_type=bias_type)
+
+    def _voronoi_process(args):
+        i, seeds, rect = args
+        poly = voronoi_cell(i, seeds, rect, None)
+        if poly is None or len(poly) < 3:
+            return
+        poly = simplify_poly(poly)
+        if len(poly) < 3:
+            return
+
+        lo = np.min(poly, axis=0)
+        hi = np.max(poly, axis=0)
+
+        if np.prod(hi - lo) < 4.0:
+            return
+        
+        return poly
+
+    polygons = [x for x in thread_pool.map(_voronoi_process, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
+
+    if len(manual_seeds) > 0:
+            centers = manual_seeds
+    else:
+        centers = generate_seeds(w, h, rng.integers(1, 3, endpoint=True), img_small, rng, bias_type)
+    
+    lengths = [len(poly) for poly in polygons]
+    merged = np.concatenate(polygons)
+    merged = warp_points(merged, centers, w, h, rng)
+    polygons = np.split(merged, np.cumsum(lengths)[:-1])
+
+    return polygons
 
 
 # ---------- Triangle-based per-cell sampling ----------
@@ -694,16 +787,23 @@ def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
             return 0
         # Pixel centers in bbox
         gx, gy = np.meshgrid(np.arange(x0, x1) + 0.5, np.arange(y0, y1) + 0.5)
-        # Point-in-polygon (ray casting) — vectorized over pixels
-        inside = np.zeros(gx.shape, dtype=bool)
-        n = len(poly)
-        for i in range(n):
-            ax, ay = poly[i]
-            bx, by = poly[(i + 1) % n]
-            # Edge (ax,ay)-(bx,by); count crossings of horizontal ray to +x
-            cond = ((ay > gy) != (by > gy))
-            x_int = (bx - ax) * (gy - ay) / (by - ay + 1e-12) + ax
-            inside ^= cond & (gx < x_int)
+        # Edge endpoints, closed loop
+        ax = poly[:, 0]                     # (N,)
+        ay = poly[:, 1]
+        bx = np.roll(poly[:, 0], -1)        # (N,)  b = next vertex
+        by = np.roll(poly[:, 1], -1)
+
+        # Broadcast to (N, H, W)
+        AY = ay[:, None, None]
+        BY = by[:, None, None]
+        AX = ax[:, None, None]
+        BX = bx[:, None, None]
+
+        cond = (AY > gy) != (BY > gy)                       # (N, H, W) bool
+        x_int = (BX - AX) * (gy - AY) / (BY - AY + 1e-12) + AX
+        cross = cond & (gx < x_int)                         # (N, H, W)
+
+        inside = np.bitwise_xor.reduce(cross, axis=0)       # (H, W) bool
         if not inside.any():
             return 0
         idx = np.where(inside.ravel())[0]
@@ -728,8 +828,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         )
         pars.add_argument(
             "--cell_shape", type=str, default="voronoi",
-            choices=["voronoi", "triangles", "knife_cut", "flowers", "flowers_soft"],
-            help="Cell shape: voronoi (default) or triangles (Delaunay-based) or knife_cut or flowers",
+            choices=["voronoi", "triangles", "knife_cut", "flowers", "flowers_soft", "river", "flowers_in_river"]
         )
         pars.add_argument("--n_colors", type=int, default=12)
         pars.add_argument("--n_seeds", type=int, default=600)
@@ -830,36 +929,34 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         if cell_shape == "triangles":
             seeds = manual_seeds if len(manual_seeds) > 0 else generate_seeds(w, h, n_seeds, img_small, rng, bias_type=self.options.bias_type)
             polygons = triangle_cells(w, h, seeds)
-            if not polygons:
-                inkex.errormsg("Triangulation produced no cells.")
-                return
         elif cell_shape == "knife_cut":
             polygons = knife_cut_cells(
                 img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                 bias_type=self.options.bias_type
             )
-            if not polygons:
-                inkex.errormsg("Knife-cut produced no cells.")
-                return
         elif cell_shape == "flowers":
             polygons = flowers_cut_cells(
                 img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                 bias_type=self.options.bias_type
             )
-            if not polygons:
-                inkex.errormsg("Flowers-cut produced no cells.")
-                return
         elif cell_shape == "flowers_soft":
             polygons = flowers_soft_cut_cells(
                 img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                 bias_type=self.options.bias_type
             )
-            if not polygons:
-                inkex.errormsg("Flowers-cut produced no cells.")
-                return
+        elif cell_shape == "river":
+            polygons = river_cut_cells(
+                img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                bias_type=self.options.bias_type
+            )
+        elif cell_shape == "flowers_in_river":
+            polygons = flowers_soft_cut_cells(
+                img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                bias_type=self.options.bias_type, warp_polygons=True
+            )
         else:
             # Voronoi (original path)
-            seeds = manual_seeds if len(manual_seeds) > 0 else  generate_seeds(w, h, n_seeds, img_small, rng, bias_type=self.options.bias_type)
+            seeds = manual_seeds if len(manual_seeds) > 0 else  generate_seeds(w, h, n_seeds, img_small, rng, bias_type=self.options.bias_type)          
             rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
 
             def _voronoi_process(args):
@@ -879,6 +976,10 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
                 return poly
 
             polygons = [x for x in thread_pool.map(_voronoi_process, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
+
+        if not polygons:
+            inkex.errormsg("No cells produced.")
+            return
 
         dom_idx = dominant_palette_index_for_polygons(
             polygons, pal_indices, n_palette, w, h

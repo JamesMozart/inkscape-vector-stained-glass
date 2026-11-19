@@ -1,15 +1,16 @@
 # Inkscape Vector Stained Glass
 
-Convert a bitmap image into a vector "stained glass" pattern: the image is
-color-quantized, subdivided into cells (Voronoi, Delaunay triangles, or
-knife-cut), and each cell is filled with its dominant palette color, with dark
-strokes between cells.
+Convert a bitmap image into a stylish vector "stained glass" pattern: the image is
+color-quantized, subdivided into cells (Voronoi, Delaunay triangles, 
+knife-cut, flowers, river and so on).
 
 ![Example output](example.png)
 **Slash Dimension (knife cut)**
 ![Example output](example_slash.png)
 **Flowers (larger number of seeds for better detail)**
 ![Example output](example_flower.png)
+**River (Swirls)**
+![Example output](example_river.png)
 
 ## Features
 
