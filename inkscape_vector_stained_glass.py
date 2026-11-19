@@ -709,7 +709,7 @@ def warp_points(P, p_centers, w, h, rng,
     centers_low = grid_seeds(w, h, len(p_centers))
     centers = np.vstack([p_centers, centers_low]) / (w, h)
     n_centers = len(centers)
-    signs = np.where(np.arange(n_centers) % 2 == 0, 1.0, -1.0)
+    signs = rng.choice([1.0, -1.0], size=1) * np.where(np.arange(n_centers) % 2 == 0, 1.0, -1.0)
     # high powers + low powers
     strengths = signs * np.append(rng.uniform(0.10, 0.25, size=n_centers // 2), rng.uniform(0.02, 0.05, size=n_centers // 2))
 
