@@ -711,16 +711,16 @@ def warp_points(P, p_centers, w, h, rng,
     n_centers = len(centers)
     signs = rng.choice([1.0, -1.0], size=1) * np.where(np.arange(n_centers) % 2 == 0, 1.0, -1.0)
     # high powers + low powers
-    strengths = signs * np.append(rng.uniform(0.10, 0.25, size=n_centers // 2), rng.uniform(0.02, 0.05, size=n_centers // 2))
+    strengths = signs * np.append(rng.uniform(0.1, 0.3, size=n_centers // 2), rng.uniform(0.02, 0.05, size=n_centers // 2))
 
     # Integrate the flow field in n_steps small Euler steps
     step_strengths = strengths / n_steps
     for _ in range(n_steps):
         v = swirl_velocity(P, w, h, centers, step_strengths)
         # damping on borders
-        weight = np.min((1 - np.cos(P / (w, h) * 2 * np.pi)) / 2, axis=1)
-        np.clip(weight, 0.0, 1.0, out=weight)
-        # weight = np.min(1 - np.abs(P / (w, h) * 2 - 1) ** 0.5, axis=1)
+        # weight = np.min((1 - np.cos(P / (w, h) * 2 * np.pi)) / 2, axis=1)
+        # np.clip(weight, 0.0, 1.0, out=weight)
+        weight = np.min(1 - np.abs(P / (w, h) * 2 - 1) ** 0.5, axis=1)
 
         P += v * weight[:,None]
         np.clip(P, [0.0, 0.0], [w, h], out=P)
