@@ -323,6 +323,201 @@ def dominant_palette_index(region_labels, pal_indices, n_cells, n_palette):
     return hist.argmax(axis=1).astype(np.int32)
 
 
+# ---------- Metro tile cut ----------
+def _metro_score_grid(img_small, rng, gw, gh, bias_type):
+    """Build a (gh, gw) score map in [0, 1] used to scale tile sizes.
+
+    - 'edges'      : gradient magnitude, strong edges -> high score -> bigger tiles
+    - 'brightness' : brighter pixels -> high score -> bigger tiles
+    - else         : random uniform score
+    """
+    if bias_type not in ("edges", "brightness"):
+        return rng.uniform(size=(gh, gw))
+
+    gray = np.array(img_small.convert("L"), dtype=np.float64)
+    raw = 1.0 - _edge_map(gray) if bias_type == "edges" else gray / 256.0
+
+    # Downsample to grid resolution with block mean (crop to multiple of gw/gh)
+    hh, ww = raw.shape
+    ys = (np.arange(gh + 1) * hh / gh).astype(np.int64); ys[-1] = hh
+    xs = (np.arange(gw + 1) * ww / gw).astype(np.int64); xs[-1] = ww
+    sums = np.add.reduceat(np.add.reduceat(raw, ys[:-1], axis=0), xs[:-1], axis=1)
+    counts = np.outer(np.diff(ys), np.diff(xs))
+    scores = sums / counts
+    # norm
+    scores -= scores.min()
+    scores /= scores.max() + 1e-12
+    return scores
+
+def metro_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                    bias_type):
+    """Generate Metro-style rectangular tiles covering [0,w]x[0,h].
+
+    Strategy:
+      1. Estimate a low-res grid (gw, gh) from (w, h) aspect and n_seeds.
+      2. Place max-size tiles at manual_seeds (pre-occupied).
+      3. Fill the grid with Metro rectangles in integer grid units:
+         batch candidates -> sort by area desc -> greedy vectorized placement
+         -> integral-image hole fill.
+      4. Scale grid rectangles back to (w, h) float coordinates.
+    """
+    w = float(w)
+    h = float(h)
+    if w < 1 or h < 1 or n_seeds < 1:
+        return []
+
+    # ---- 1. Low-res grid size from aspect ratio and n_seeds ----
+    aspect = w / max(h, 1e-6)
+    gw = max(2, int(round(math.sqrt(n_seeds * aspect))))
+    gh = max(2, int(round(n_seeds / gw)))
+    gw = max(2, min(gw, int(w)))
+    gh = max(2, min(gh, int(h)))
+
+    min_side = 1
+    max_side = 3
+    min_long = 1
+    max_long = max_side
+    min_short = 1
+    max_short = max_side
+
+    cand_tiles = np.column_stack([
+        np.repeat(np.arange(min_long, max_long + 1), max_long - min_long + 1),
+        np.tile(np.arange(min_short, max_short + 1), max_short - min_short + 1),
+    ])
+    areas = cand_tiles.prod(axis=1)
+    cand_tiles = cand_tiles[np.argsort(areas)]
+
+    occupied = np.zeros((gh, gw), dtype=bool)
+    placed = []          # (x, y, rw, rh) in grid units
+    occupied_area = 0
+
+    # ---- 2. Pre-place max-size tiles at manual seeds ----
+    if manual_seeds is not None and len(manual_seeds) > 0:
+        seeds = np.asarray(manual_seeds, dtype=np.float64)
+        # manual_seeds are in (w, h) float coordinates -> grid units
+        g_seeds = np.clip(seeds * (gw / w, gh / h), (0, 0), (gw - 1, gh - 1)).astype(np.int64)
+
+        # max-size tile: square max_side x max_side (clamped to grid)
+        tw = min(max_side, gw)
+        th = min(max_side, gh)
+
+        for cx, cy in g_seeds:
+            # center the tile on the seed where possible
+            xi = int(cx - tw // 2)
+            yi = int(cy - th // 2)
+            xi = max(0, min(xi, gw - tw))
+            yi = max(0, min(yi, gh - th))
+            region = occupied[yi:yi + th, xi:xi + tw]
+            if region.any():
+                # try to slide to a free spot near the seed
+                best = None
+                best_d = None
+                for dy in range(-th, th + 1):
+                    for dx in range(-tw, tw + 1):
+                        nx = xi + dx
+                        ny = yi + dy
+                        if nx < 0 or ny < 0 or nx + tw > gw or ny + th > gh:
+                            continue
+                        if occupied[ny:ny + th, nx:nx + tw].any():
+                            continue
+                        d = dx * dx + dy * dy
+                        if best_d is None or d < best_d:
+                            best_d = d
+                            best = (nx, ny)
+                if best is None:
+                    continue
+                xi, yi = best
+            occupied[yi:yi + th, xi:xi + tw] = True
+            occupied_area += tw * th
+            placed.append((xi, yi, tw, th))
+
+    total_area = gw * gh
+
+    # ---- 3. Batch-generate integer-grid candidates ----
+    n_cand = int(min(max(n_seeds * 12, 400), 200_000))
+    horiz = rng.random(n_cand) < 0.5
+
+    x = (rng.random(n_cand) * gw).astype(np.int64)
+    y = (rng.random(n_cand) * gh).astype(np.int64)
+
+    score_grid = _metro_score_grid(img_small, rng, gw, gh, bias_type)
+    score = score_grid[y, x]
+    # pick tiles by score
+    tile = cand_tiles[np.floor(score * len(cand_tiles)).astype(np.int64)]
+    long_side = tile[:,0]
+    short_side = tile[:,1]
+
+    rw = np.where(horiz, long_side, short_side)
+    rh = np.where(horiz, short_side, long_side)
+
+    rw = np.minimum(tile[:,0], gw)
+    rh = np.minimum(tile[:,1], gh)
+    
+    # realign to center
+    x -= rw // 2
+    y -= rh // 2
+
+    valid = (x >= 0) & (x + rw <= gw) & (y >= 0) & (y + rh <= gh)
+    x, y, rw, rh = x[valid], y[valid], rw[valid], rh[valid]
+    n_cand = len(rw)
+    if n_cand == 0 and not placed:
+        return []
+
+    # ---- 4. Greedy placement on the low-res grid ----
+    max_rects = max(n_seeds * 6, 200)
+
+    for i in range(len(rw)):
+        if len(placed) >= max_rects:
+            break
+        if occupied_area >= total_area * 0.985:
+            break
+        xi, yi, wi, hi = int(x[i]), int(y[i]), int(rw[i]), int(rh[i])
+        region = occupied[yi:yi + hi, xi:xi + wi]
+        if region.any():
+            continue
+        occupied[yi:yi + hi, xi:xi + wi] = True
+        occupied_area += wi * hi
+        placed.append((xi, yi, wi, hi))
+
+    # ---- 5. Vectorized hole fill via integral image ----
+    fill_size = max(1, min_side)
+    if fill_size < gw and fill_size < gh:
+        integral = np.zeros((gh + 1, gw + 1), dtype=np.int32)
+        np.cumsum(occupied, axis=0, out=integral[1:, 1:])
+        np.cumsum(integral[1:, 1:], axis=1, out=integral[1:, 1:])
+
+        ys = np.arange(0, gh - fill_size + 1, fill_size)
+        xs = np.arange(0, gw - fill_size + 1, fill_size)
+        YY, XX = np.meshgrid(ys, xs, indexing="ij")
+        Y2 = YY + fill_size
+        X2 = XX + fill_size
+        block_sum = (integral[Y2, X2] - integral[YY, X2]
+                     - integral[Y2, XX] + integral[YY, XX])
+        ey, ex = np.where(block_sum == 0)
+        for k in range(len(ey)):
+            yi = int(ys[ey[k]]); xi = int(xs[ex[k]])
+            if occupied[yi:yi + fill_size, xi:xi + fill_size].any():
+                continue
+            occupied[yi:yi + fill_size, xi:xi + fill_size] = True
+            placed.append((xi, yi, fill_size, fill_size))
+
+    # ---- 6. Scale grid rects -> (w, h) float polygons ----
+    if not placed:
+        return []
+    ratio = (w / gw, h / gh)
+    polys = [
+        np.array([
+            [xi, yi],
+            [xi + wi, yi],
+            [xi + wi, yi + hi],
+            [xi, yi + hi],
+        ], dtype=np.float64) * ratio
+        for (xi, yi, wi, hi) in placed
+    ]
+    
+    return polys
+
+
 # ---------- knife cut ----------
 def _component_edge_energy(comp_info, labels, edge_map):
     """Mean edge strength inside each component's mask."""
@@ -711,7 +906,7 @@ def warp_points(P, p_centers, w, h, rng,
     n_centers = len(centers)
     signs = rng.choice([1.0, -1.0], size=1) * np.where(np.arange(n_centers) % 2 == 0, 1.0, -1.0)
     # high powers + low powers
-    strengths = signs * np.append(rng.uniform(0.1, 0.3, size=n_centers // 2), rng.uniform(0.02, 0.05, size=n_centers // 2))
+    strengths = signs * np.append(rng.uniform(0.10, 0.25, size=n_centers // 2), rng.uniform(0.02, 0.05, size=n_centers // 2))
 
     # Integrate the flow field in n_steps small Euler steps
     step_strengths = strengths / n_steps
@@ -828,7 +1023,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         )
         pars.add_argument(
             "--cell_shape", type=str, default="voronoi",
-            choices=["voronoi", "triangles", "knife_cut", "flowers", "flowers_soft", "river", "flowers_in_river"]
+            choices=["voronoi", "triangles", "knife_cut", "metro", "flowers", "flowers_soft", "river", "flowers_in_river"]
         )
         pars.add_argument("--n_colors", type=int, default=12)
         pars.add_argument("--n_seeds", type=int, default=600)
@@ -934,6 +1129,11 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
                 img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                 bias_type=self.options.bias_type
             )
+        elif cell_shape == "metro":
+            polygons = metro_cut_cells(
+                img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                bias_type=self.options.bias_type
+            )
         elif cell_shape == "flowers":
             polygons = flowers_cut_cells(
                 img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
@@ -977,7 +1177,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
 
             polygons = [x for x in thread_pool.map(_voronoi_process, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
 
-        if not polygons:
+        if len(polygons) == 0:
             inkex.errormsg("No cells produced.")
             return
 

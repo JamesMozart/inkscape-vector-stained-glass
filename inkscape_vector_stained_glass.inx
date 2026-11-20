@@ -9,6 +9,7 @@
         <option value="voronoi">Voronoi (cracked glass)</option>
         <option value="triangles">Triangles (Delaunay)</option>
         <option value="knife_cut">Knife cut (Slash Dimension)</option>
+        <option value="metro">Metro</option>
         <option value="flowers">Flowers</option>
         <option value="flowers_soft">Flowers (soft edges)</option>
         <option value="river">River</option>
