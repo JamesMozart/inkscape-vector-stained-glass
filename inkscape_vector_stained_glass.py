@@ -9,7 +9,7 @@ from PIL import Image, ImageFilter
 
 from inkex.units import convert_unit
 
-from image_helper import pil_quantize_indices, same_color_components, component_representative_points_dt, thread_pool
+from image_helper import pil_quantize_indices, same_color_components, component_representative_points_dt, simple_saliency, thread_pool
 from geometry_helper import clip_polygon_halfplane, clip_polygon_rect, solve_linear_abc, voronoi_cell, simplify_poly, snap_points_to_rect,\
     dedupe_points, ray_polygon_intersections, polygon_area, polygon_centroid
 
@@ -264,19 +264,25 @@ def grid_seeds(w, h, n_seeds, min_dist=None, rng=None):
     return seeds[:n_found]
 
 
-def generate_seeds(w, h, n_seeds, img_small, rng, bias_type):
+def _seed_weights(img_small, rng, bias_type):
+    weights = None
     if bias_type == 'edges':
         gray = np.array(img_small.convert("L"), dtype=np.float64)
-        gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
-        gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
-        edge_map = gx + gy
-        prob = edge_map.ravel() + edge_map.mean() * 0.5
-        prob /= prob.sum()
-        idx = rng.choice(w * h, n_seeds, replace=False, p=prob)
-        return np.stack([idx % w, idx // w], axis=1).astype(np.float64)
+        edge_map = _edge_map(gray)
+        weights = edge_map + edge_map.mean() * 0.5
     elif bias_type == 'brightness':
         gray = np.array(img_small.convert("L"), dtype=np.float64)
-        prob = 256.0 - gray.ravel()
+        weights = 256.0 - gray
+    elif bias_type == 'saliency':
+        weights = simple_saliency(img_small.convert("L"))
+
+    return weights
+
+def generate_seeds(w, h, n_seeds, img_small, rng, bias_type):
+    weights = _seed_weights(img_small, rng, bias_type)
+
+    if weights is not None:
+        prob = weights.ravel()
         prob /= prob.sum()
         idx = rng.choice(w * h, n_seeds, replace=False, p=prob)
         return np.stack([idx % w, idx // w], axis=1).astype(np.float64)
@@ -334,8 +340,9 @@ def _metro_score_grid(img_small, rng, gw, gh, bias_type):
     if bias_type not in ("edges", "brightness"):
         return rng.uniform(size=(gh, gw))
 
-    gray = np.array(img_small.convert("L"), dtype=np.float64)
-    raw = 1.0 - _edge_map(gray) if bias_type == "edges" else gray / 256.0
+    weights = _seed_weights(img_small, rng, bias_type)
+    weights /= weights.max()
+    raw = 1.0 - weights
 
     # Downsample to grid resolution with block mean (crop to multiple of gw/gh)
     hh, ww = raw.shape
@@ -606,25 +613,8 @@ def centroid_cut_sparse(centroids, w, h, n_seeds, rng, edge_map=None):
         cells = new_cells
     return cells
 
-def _select_centroids_by_area_with_quota(comp_pal, comp_ids, comp_info,
-                                         n_seeds, edge_energy=None,
-                                         edge_bonus=0.0,
-                                         palette=None,
-                                         brightness_bonus=0.0):
-    """Select up to n_seeds component indices:
-       1. Guarantee at least one component per palette color (the largest one).
-       2. Fill the remaining budget with the largest components overall.
-
-    If edge_energy is provided and edge_bonus > 0, ranking adds
-    edge_bonus * (normalized edge energy).
-
-    If palette is provided and brightness_bonus > 0, each component's
-    brightness is taken directly from its palette color (components are
-    single-color by construction). Darker components get a higher score,
-    so brighter areas have a lower selection probability.
-
-    Returns a sorted list of indices into the centroid/comp_pal lists.
-    """
+def _select_centroids_by_area_with_quota(labels, comp_pal, comp_ids, comp_info,
+                                         n_seeds, bias_scores, bias_score_bonus=0.5):
     m = len(comp_pal)
     if m <= n_seeds:
         return list(range(m))
@@ -635,20 +625,21 @@ def _select_centroids_by_area_with_quota(comp_pal, comp_ids, comp_info,
 
     score = a_norm.copy()
 
-    if edge_energy is not None and edge_bonus > 0.0:
-        ee = edge_energy[np.asarray(comp_ids)]
-        emax = ee.max()
-        e_norm = ee / emax if emax > 0 else ee
-        score = score + edge_bonus * e_norm
+    # ---- vectorized bias score per component ----
+    bias_scores /= bias_scores.max()
+    flat_labels = labels.ravel()
+    flat_bias = bias_scores.ravel()
 
-    if palette is not None and brightness_bonus > 0.0:
-        pal = np.array(comp_pal, dtype=np.int64)
-        colors = np.asarray(palette, dtype=np.float64)[pal]  # (m, 3)
-        # Perceptual-ish luma (Rec. 601)
-        luma = 0.299 * colors[:, 0] + 0.587 * colors[:, 1] + 0.114 * colors[:, 2]
-        lmax = luma.max()
-        l_norm = luma / lmax if lmax > 0 else luma
-        score = score + brightness_bonus * l_norm
+    n_labels = flat_labels.max()
+    sums = np.bincount(flat_labels, weights=flat_bias, minlength=n_labels)
+    counts = np.bincount(flat_labels, minlength=n_labels)
+
+    ids = np.asarray(comp_ids)
+    comp_bias = np.zeros(len(ids), dtype=np.float64)
+    valid = counts[ids] > 0
+    comp_bias[valid] = sums[ids[valid]] / counts[ids[valid]]
+
+    score += comp_bias * bias_score_bonus
 
     pal = np.array(comp_pal, dtype=np.int64)
 
@@ -677,9 +668,7 @@ def _select_centroids_by_area_with_quota(comp_pal, comp_ids, comp_info,
     return sorted(selected)
 
 def knife_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
-                    bias_type, bridge_ratio=0.01,
-                    edge_weight=0.5, edge_bonus=0.5,
-                    brightness_bonus=0.5):
+                    bias_type, bridge_ratio=0.01):
     seed_from_edges = bias_type == 'edges'
     edge_map = None
     gray = None
@@ -693,26 +682,19 @@ def knife_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, m
         labels, comp_info = same_color_components(
             pal_indices, bridge_radius=bridge_r
         )
-
-        edge_energy = None
-        if seed_from_edges:
-            edge_energy = _component_edge_energy(comp_info, labels, edge_map)
+        bias_scores = _seed_weights(img_small, rng, bias_type)
 
         centroids, comp_pal, comp_ids = component_representative_points_dt(
             labels, comp_info, min_area,
-            edge_map=edge_map,
-            edge_weight=edge_weight if seed_from_edges else 0.0,
+            bias_scores
         )
         if not centroids:
             return []
 
         if len(centroids) > 1:
             keep = _select_centroids_by_area_with_quota(
-                comp_pal, comp_ids, comp_info, int(n_seeds),
-                edge_energy=edge_energy,
-                edge_bonus=edge_bonus if seed_from_edges else 0.0,
-                palette=palette,
-                brightness_bonus=brightness_bonus if bias_type == 'brightness' else 0.0,
+                labels, comp_pal, comp_ids, comp_info, int(n_seeds),
+                bias_scores
             )
             centroids = [centroids[i] for i in keep]
     else:
@@ -1029,7 +1011,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         pars.add_argument("--n_seeds", type=int, default=600)
         pars.add_argument("--stroke_width", type=float, default=2.0)
         pars.add_argument("--bias_type", type=str, default="none",
-            choices=["none", "edges", "brightness"],
+            choices=["none", "edges", "brightness", "saliency"],
         )
         pars.add_argument("--random_seed", type=int, default=42)
         pars.add_argument("--max_dim", type=int, default=600)

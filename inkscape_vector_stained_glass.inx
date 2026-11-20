@@ -23,6 +23,7 @@
         <option value="none">None</option>
         <option value="edges">Edges</option>
         <option value="brightness">Brightness</option>
+        <option value="saliency">Saliency</option>
     </param>
     <param name="random_seed" type="int" gui-text="Random seed" min="1" max="2147483647">42</param>
     <param name="blur_size" type="int" min="0" max="10" gui-text="Pre-processing blur size">0</param>

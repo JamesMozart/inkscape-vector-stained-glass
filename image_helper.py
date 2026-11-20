@@ -1,5 +1,5 @@
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 from concurrent.futures import ThreadPoolExecutor
 
 thread_pool = ThreadPoolExecutor()
@@ -359,7 +359,7 @@ def _dt_2d_sq(mask):
 
 
 def component_representative_points_dt(labels, comp_info, min_area,
-                                        edge_map=None, edge_weight=0.0):
+                                        bias_scores=None, bias_scores_bonus=0.5):
     """Same as before, but each component's DT/argmax is computed in parallel.
 
     Returns (centroids, comp_pal, comp_ids):
@@ -385,23 +385,23 @@ def component_representative_points_dt(labels, comp_info, min_area,
         y0, y1 = int(ys.min()), int(ys.max()) + 1
         x0, x1 = int(xs.min()), int(xs.max()) + 1
         tasks.append((k, color, labels, y0, y1, x0, x1,
-                      edge_map, edge_weight))
+                      bias_scores, bias_scores_bonus))
 
     if not tasks:
         return centroids, comp_pal, comp_ids
 
     def _process_component(args):
         """Worker: handle one component and return its representative point or None."""
-        k, color, labels, y0, y1, x0, x1, edge_map, edge_weight = args
+        k, color, labels, y0, y1, x0, x1, bias_scores, bias_scores_bonus = args
 
         sub_mask = (labels[y0:y1, x0:x1] == k)  # (h', w') bool
         dist_sq = _dt_2d_sq(sub_mask)
 
-        if edge_map is not None and edge_weight > 0.0:
-            sub_edge = edge_map[y0:y1, x0:x1]
+        if bias_scores is not None and bias_scores_bonus > 0.0:
+            sub_edge = bias_scores[y0:y1, x0:x1]
             dmax = dist_sq[sub_mask].max()
             dt_norm = dist_sq / dmax if dmax > 0 else dist_sq
-            score = dt_norm + edge_weight * sub_edge
+            score = dt_norm + bias_scores_bonus * sub_edge
             score = np.where(sub_mask, score, -np.inf)
         else:
             score = dist_sq
@@ -423,3 +423,12 @@ def component_representative_points_dt(labels, comp_info, min_area,
         comp_ids.append(k)
 
     return centroids, comp_pal, comp_ids
+
+def simple_saliency(gray: Image.Image, radius=15):
+    fg = np.array(gray, dtype=np.float32)
+    bg = np.array(gray.filter(ImageFilter.BoxBlur(radius)), dtype=np.float32)
+    diff = np.abs(fg - bg)
+    mx = diff.max()
+    if mx > 0:
+        diff /= mx
+    return diff
