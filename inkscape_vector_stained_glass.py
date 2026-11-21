@@ -337,10 +337,9 @@ def _metro_score_grid(img_small, rng, gw, gh, bias_type):
     - 'brightness' : brighter pixels -> high score -> bigger tiles
     - else         : random uniform score
     """
-    if bias_type not in ("edges", "brightness"):
-        return rng.uniform(size=(gh, gw))
-
     weights = _seed_weights(img_small, rng, bias_type)
+    if weights is None:
+        return rng.uniform(size=(gh, gw))
     weights /= weights.max()
     raw = 1.0 - weights
 
@@ -886,9 +885,9 @@ def warp_points(P, p_centers, w, h, rng,
     centers_low = grid_seeds(w, h, len(p_centers))
     centers = np.vstack([p_centers, centers_low]) / (w, h)
     n_centers = len(centers)
-    signs = rng.choice([1.0, -1.0], size=1) * np.where(np.arange(n_centers) % 2 == 0, 1.0, -1.0)
+    signs = rng.choice([1.0, -1.0], size=n_centers)
     # high powers + low powers
-    strengths = signs * np.append(rng.uniform(0.10, 0.25, size=n_centers // 2), rng.uniform(0.02, 0.05, size=n_centers // 2))
+    strengths = signs * np.append(rng.uniform(0.1, 0.25, size=n_centers // 2), rng.uniform(0.02, 0.05, size=n_centers // 2))
 
     # Integrate the flow field in n_steps small Euler steps
     step_strengths = strengths / n_steps
@@ -931,7 +930,7 @@ def river_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, m
     polygons = [x for x in thread_pool.map(_voronoi_process, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
 
     if len(manual_seeds) > 0:
-            centers = manual_seeds
+        centers = manual_seeds
     else:
         centers = generate_seeds(w, h, rng.integers(1, 3, endpoint=True), img_small, rng, bias_type)
     
