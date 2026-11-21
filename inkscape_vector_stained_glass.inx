@@ -16,7 +16,7 @@
         <option value="flowers_in_river">Flowers in river</option>
     </param>
     <param name="n_colors" type="int" min="4" max="32" gui-text="Palette colors">12</param>
-    <param name="n_seeds" type="int" min="4" max="3000" gui-text="Number of seeds">600</param>
+    <param name="n_seeds" type="int" min="4" max="5000" gui-text="Number of seeds">600</param>
     <param name="stroke_width" type="float" min="0.5" max="10" gui-text="Lead line width">2.0</param>
     <param name="bias_type" type="optiongroup" appearance="combo"
        gui-text="Bias seeds by:">
@@ -29,7 +29,7 @@
     <param name="blur_size" type="int" min="0" max="10" gui-text="Pre-processing blur size">0</param>
     <param name="max_dim" type="int"
        min="16" max="1080"
-       gui-text="Processing resolution (px)">300</param>
+           gui-text="Processing resolution (px, set it larger for > 1000 seeds)">300</param>
     <effect>
         <object-type>all</object-type>
         <effects-menu>
