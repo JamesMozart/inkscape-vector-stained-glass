@@ -10,7 +10,7 @@ from PIL import Image, ImageFilter
 from inkex.units import convert_unit
 
 from image_helper import pil_quantize_indices, same_color_components, component_representative_points_dt, simple_saliency, thread_pool
-from geometry_helper import clip_polygon_halfplane, clip_polygon_rect, solve_linear_abc, voronoi_cell, simplify_poly, snap_points_to_rect,\
+from geometry_helper import clip_polygon_halfplane, clip_polygon_halfplane_both, clip_polygon_rect, solve_linear_abc, voronoi_cell, simplify_poly, snap_points_to_rect,\
     dedupe_points, ray_polygon_intersections, polygon_area, polygon_centroid
 
 
@@ -300,23 +300,6 @@ def _edge_map(gray):
     return e / mx if mx > 0 else e
 
 
-def _component_edge_energy(comp_info, labels, edge_map):
-    """Mean edge strength inside each component's mask."""
-    n = len(comp_info)
-    out = np.zeros(n, dtype=np.float64)
-    if edge_map is None:
-        return out
-    # Group pixels by component id once, then average edge_map over each group.
-    # labels is (h, w); flat edge_map indexed the same way.
-    flat_labels = labels.ravel()
-    flat_edge = edge_map.ravel()
-    # Sum edge per component
-    sums = np.bincount(flat_labels, weights=flat_edge, minlength=n)
-    counts = np.bincount(flat_labels, minlength=n)
-    nz = counts > 0
-    out[nz] = sums[nz] / counts[nz]
-    return out
-
 # ---------- A3: dominant palette index per cell (bincount + argmax) ----------
 
 def dominant_palette_index(region_labels, pal_indices, n_cells, n_palette):
@@ -525,23 +508,6 @@ def metro_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, m
 
 
 # ---------- knife cut ----------
-def _component_edge_energy(comp_info, labels, edge_map):
-    """Mean edge strength inside each component's mask."""
-    n = len(comp_info)
-    out = np.zeros(n, dtype=np.float64)
-    if edge_map is None:
-        return out
-    # Group pixels by component id once, then average edge_map over each group.
-    # labels is (h, w); flat edge_map indexed the same way.
-    flat_labels = labels.ravel()
-    flat_edge = edge_map.ravel()
-    # Sum edge per component
-    sums = np.bincount(flat_labels, weights=flat_edge, minlength=n)
-    counts = np.bincount(flat_labels, minlength=n)
-    nz = counts > 0
-    out[nz] = sums[nz] / counts[nz]
-    return out
-
 def _pair_edge_score(pts, pairs, edge_map):
     """Average edge strength sampled at both endpoints of pair (i, j)."""
     if edge_map is None:
@@ -601,8 +567,7 @@ def centroid_cut_sparse(centroids, w, h, n_seeds, rng, edge_map=None):
             break
         new_cells = []
         for poly in cells:
-            left = clip_polygon_halfplane(poly, a, b, c)
-            right = clip_polygon_halfplane(poly, -a, -b, -c)
+            left, right = clip_polygon_halfplane_both(poly, a, b, c)
             left = simplify_poly(left)
             right = simplify_poly(right)
             if len(left) >= 3:
@@ -942,6 +907,104 @@ def river_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, m
     return polygons
 
 
+# ---------- line sweep cut ----------
+
+def splinters_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                         bias_type, angle_jitter=0.6):
+    """Sequential splinters cut.
+
+    Strategy:
+      1. Generate seeds (manual if provided, else by bias).
+      2. Start with the full rectangle.
+      3. Process seeds one by one; for the polygon that currently contains the
+         seed, cut it with a random-angle line passing through the seed
+         (a through-the-point half-plane split), keeping both halves.
+         The seed's own polygon is split, so later seeds land in smaller cells.
+
+    angle_jitter: max deviation from a "spread" orientation, in radians
+    (uniform random angle is also fine; this keeps cuts less parallel).
+    """
+    rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
+
+    if manual_seeds is not None and len(manual_seeds) > 0:
+        seeds = np.asarray(manual_seeds, dtype=np.float64)
+    else:
+        seeds = generate_seeds(w, h, n_seeds, img_small, rng, bias_type)
+
+    if len(seeds) == 0:
+        return [rect]
+
+    # Start with a single rectangle; cells list holds current polygons.
+    cells = [rect]
+
+    def _point_in_poly(pt, poly):
+        """Even-odd point-in-polygon test (closed loop)."""
+        gx, gy = pt[0], pt[1]
+        x0, y0 = np.min(poly, axis=0)
+        x1, y1 = np.max(poly, axis=0)
+        if gx < x0 or gx > x1 or gy < y0 or gy > y1:
+            return False
+        
+        # Edge endpoints, closed loop
+        ax = poly[:, 0]                     # (N,)
+        ay = poly[:, 1]
+        bx = np.roll(poly[:, 0], -1)        # (N,)  b = next vertex
+        by = np.roll(poly[:, 1], -1)
+
+        # Broadcast to (N, H, W)
+        AY = ay[:, None, None]
+        BY = by[:, None, None]
+        AX = ax[:, None, None]
+        BX = bx[:, None, None]
+
+        cond = (AY > gy) != (BY > gy)                       # (N, H, W) bool
+        x_int = (BX - AX) * (gy - AY) / (BY - AY + 1e-12) + AX
+        cross = cond & (gx < x_int)                         # (N, H, W)
+
+        inside = np.bitwise_xor.reduce(cross, axis=0)       # (H, W) bool
+        return inside.any()
+
+    base_angles = np.linspace(0.0, rng.choice([-np.pi, np.pi]), max(len(seeds), 1), endpoint=False) + rng.uniform(0, 2 * np.pi)
+
+    for k, seed in enumerate(seeds):
+        # Find the cell containing this seed
+        target = None
+        for ci, poly in enumerate(cells):
+            if _point_in_poly(seed, poly):
+                target = ci
+                break
+        if target is None:
+            continue
+
+        poly = cells[target]
+
+        # Random line angle: golden-angle-ish base + jitter
+        theta = base_angles[k % len(base_angles)] + rng.uniform(-angle_jitter, angle_jitter)
+        # Direction vector
+        dx, dy = math.cos(theta), math.sin(theta)
+
+        # Line through seed: normal (a, b), c such that a*x + b*y + c = 0
+        a = -dy
+        b = dx
+        c = -(a * seed[0] + b * seed[1])
+
+        left, right = clip_polygon_halfplane_both(poly, a, b, c)
+        left = simplify_poly(left)
+        right = simplify_poly(right)
+        if len(left) < 3 or len(right) < 3:
+            # Degenerate cut: skip this seed
+            continue
+
+        # Replace the target cell with the two halves
+        cells[target] = left
+        cells.append(right)
+
+        if len(cells) >= n_seeds * 4:
+            break
+
+    return cells
+
+
 # ---------- Triangle-based per-cell sampling ----------
 
 def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
@@ -1004,7 +1067,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         )
         pars.add_argument(
             "--cell_shape", type=str, default="voronoi",
-            choices=["voronoi", "triangles", "knife_cut", "metro", "flowers", "flowers_soft", "river", "flowers_in_river"]
+            choices=["voronoi", "triangles", "knife_cut", "metro", "flowers", "flowers_soft", "river", "flowers_in_river", "splinters"]
         )
         pars.add_argument("--n_colors", type=int, default=12)
         pars.add_argument("--n_seeds", type=int, default=600)
@@ -1134,6 +1197,11 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
             polygons = flowers_soft_cut_cells(
                 img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                 bias_type=self.options.bias_type, warp_polygons=True
+            )
+        elif cell_shape == "splinters":
+            polygons = splinters_cut_cells(
+                img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                bias_type=self.options.bias_type, # warp_polygons=True
             )
         else:
             # Voronoi (original path)

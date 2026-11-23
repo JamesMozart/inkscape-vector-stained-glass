@@ -43,6 +43,69 @@ def clip_polygon_halfplane(poly, a, b, c):
     return np.asarray(out, dtype=float) if out else np.empty((0, 2), dtype=float)
 
 
+def clip_polygon_halfplane_both(poly, a, b, c, eps=1e-9):
+    """Clip a convex polygon against a*x + b*y + c <= 0 AND >= 0.
+
+    Returns
+    -------
+    left : ndarray (M, 2)
+        The part with a*x + b*y + c <= 0.
+    right : ndarray (K, 2)
+        The part with a*x + b*y + c >= 0.
+    Each may be empty (shape (0, 2)) if the polygon lies entirely on the
+    other side.  Together they partition the input polygon.
+    """
+    poly = np.asarray(poly, dtype=float)
+    n = len(poly)
+    empty = np.empty((0, 2), dtype=float)
+    if n == 0:
+        return empty, empty
+
+    ab = np.array([a, b], dtype=float)
+    dist = poly @ ab + c                     # (N,)
+    inside_lo = dist <= eps                  # <= 0 side
+    inside_hi = dist >= -eps                 # >= 0 side
+
+    lo_size = inside_lo.sum()
+    hi_size = inside_hi.sum()
+
+    # Fully on one side: one side is the whole polygon, the other empty.
+    if lo_size == n:
+        return poly, empty
+    if hi_size == n:
+        return empty, poly
+
+    def _clip(mask):
+        """Sutherland-Hodgman using a precomputed inside mask."""
+        prev_mask = np.roll(mask, 1)
+        out = []
+        prev = poly[-1]
+        for i in range(n):
+            cur = poly[i]
+            if mask[i]:
+                if not prev_mask[i]:
+                    out.append(_intersect(prev, cur, dist))
+                out.append(cur)
+            elif prev_mask[i]:
+                out.append(_intersect(prev, cur, dist))
+            prev = cur
+        return np.asarray(out, dtype=float) if out else empty
+
+    def _intersect(p1, p2, d):
+        # d holds distances for the whole polygon; recompute per-edge is cheap
+        d1 = p1 @ ab + c
+        d2 = p2 @ ab + c
+        denom = d1 - d2
+        if abs(denom) < 1e-12:
+            return p1
+        t = d1 / denom
+        return p1 + t * (p2 - p1)
+
+    left = _clip(inside_lo)
+    right = _clip(inside_hi)
+    return left, right
+
+
 def clip_polygon_rect(poly, w, h):
     """Clip a convex polygon against the rectangle [0,w]x[0,h]."""
     poly = clip_polygon_halfplane(poly, -1.0, 0.0, 0.0)   # x >= 0

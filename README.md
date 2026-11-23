@@ -16,6 +16,8 @@ fully editable.
 ![Example output](example_river.png)
 **Metro (rectangular tiling, delete some cells to open some windows on it)**
 ![Example output](example_metro.png)
+**Splinters**
+![Example output](example_splinters.png)
 
 ## Features
 
