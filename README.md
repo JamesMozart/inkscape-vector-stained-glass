@@ -16,10 +16,12 @@ fully editable.
 ![Example output](example_river.png)
 **Metro (rectangular tiling, delete some cells to open some windows on it)**
 ![Example output](example_metro.png)
+**Splinters**
+![Example output](example_splinters.png)
 
 ## Features
 
-- Three cell shapes:
+- Varies cell shapes:
   - `voronoi` — organic polygonal cells from Poisson-disk / edge-weighted / brightness-weighted seeds
   - `triangles` — Delaunay-based triangular cells with snapped boundary points
   - `knife_cut` — "Slash Dimension" style sparse perpendicular-bisector cuts between nearest same-color region centroids
@@ -28,6 +30,11 @@ fully editable.
   several large regions, then place ring-shaped "petal" seeds
   inside each region (radius grows quadratically outward with angular
   jitter) and re-run Voronoi to get flower-like radial cells.
+  - `splinters` — sequential "wood splinter" cut: seeds are generated
+  (Poisson-disk or bias-weighted), then processed one by one; each seed
+  splits the polygon that currently contains it with a random-angle line
+  passing through the seed, keeping both halves. Later seeds land in
+  smaller shards, producing thin, angular splinter-like panes.
 - Optional seed biasing:
   - `none` — uniform Poisson-disk sampling
   - `edges` — seeds concentrated on strong image edges
@@ -59,7 +66,7 @@ Restart Inkscape. Requires Inkscape 1.x (Python 3 + `inkex`).
 
 | Option         | Type   | Default   | Description                                                                                     |
 | -------------- | ------ | --------- | ----------------------------------------------------------------------------------------------- |
-| `cell_shape`   | choice | `voronoi` | Cell shape: `voronoi` (organic polygons), `triangles` (Delaunay), `knife_cut` (sparse perpendicular-bisector cuts between nearest same-color region centroids), `metro` (Metro-style rectangular tiling), or `flowers` (two-level radial Voronoi with petal-shaped seed rings). |
+| `cell_shape`   | choice | `voronoi` | Cell shape: `voronoi` (organic polygons), `triangles` (Delaunay), `knife_cut` (sparse perpendicular-bisector cuts between nearest same-color region centroids), `metro` (Metro-style rectangular tiling), `flowers` (two-level radial Voronoi with petal-shaped seed rings), or `splinters` (sequential random-angle line cuts through seeds, like wood splinters). |
 | `n_colors`     | int    | `12`      | Palette size for color quantization (4–32).                                                     |
 | `n_seeds`      | int    | `600`     | Number of cells (seeds / target triangles). Capped internally at `w*h/100`.                      |
 | `stroke_width` | float  | `2.0`     | Outline stroke width between cells (0.5–10).                                                    |
