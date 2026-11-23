@@ -1005,6 +1005,34 @@ def splinters_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seed
     return cells
 
 
+# ---------- voronoi cut ----------
+
+def voronoi_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                         bias_type):
+    # Voronoi (original path)
+    seeds = manual_seeds if len(manual_seeds) > 0 else  generate_seeds(w, h, n_seeds, img_small, rng, bias_type=bias_type)          
+    rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
+
+    def _voronoi_process(args):
+        i, seeds, rect = args
+        poly = voronoi_cell(i, seeds, rect, None)
+        if poly is None or len(poly) < 3:
+            return
+        poly = simplify_poly(poly)
+        if len(poly) < 3:
+            return
+
+        lo = np.min(poly, axis=0)
+        hi = np.max(poly, axis=0)
+
+        if np.prod(hi - lo) < 4.0:
+            return
+        return poly
+
+    polygons = [x for x in thread_pool.map(_voronoi_process, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
+    return polygons
+
+
 # ---------- Triangle-based per-cell sampling ----------
 
 def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
@@ -1204,27 +1232,10 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
                 bias_type=self.options.bias_type, # warp_polygons=True
             )
         else:
-            # Voronoi (original path)
-            seeds = manual_seeds if len(manual_seeds) > 0 else  generate_seeds(w, h, n_seeds, img_small, rng, bias_type=self.options.bias_type)          
-            rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
-
-            def _voronoi_process(args):
-                i, seeds, rect = args
-                poly = voronoi_cell(i, seeds, rect, None)
-                if poly is None or len(poly) < 3:
-                    return
-                poly = simplify_poly(poly)
-                if len(poly) < 3:
-                    return
-
-                lo = np.min(poly, axis=0)
-                hi = np.max(poly, axis=0)
-
-                if np.prod(hi - lo) < 4.0:
-                    return
-                return poly
-
-            polygons = [x for x in thread_pool.map(_voronoi_process, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
+            polygons = voronoi_cut_cells(
+                img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                bias_type=self.options.bias_type, # warp_polygons=True
+            )
 
         if len(polygons) == 0:
             inkex.errormsg("No cells produced.")
