@@ -51,6 +51,7 @@ fully editable.
    - macOS: `~/Library/Application Support/org.inkscape.Inkscape/config/inkscape/extensions/`
    - Windows: `%APPDATA%\inkscape\extensions\`
 2. Restart Inkscape.
+3. Open menu: Extensions -> Render -> Vector Stained Glass
 
 ## Usage
 
