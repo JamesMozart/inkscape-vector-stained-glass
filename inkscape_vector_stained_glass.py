@@ -1313,16 +1313,17 @@ def voronoi_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds,
 
 def crystals_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                          bias_type):
-    centers = manual_seeds if len(manual_seeds) > 0 else generate_seeds(w, h, max(2, n_seeds // 100), img_small, rng, bias_type=bias_type)
+    centers = manual_seeds if len(manual_seeds) > 0 else generate_seeds(w, h, n_seeds // 100 + 1, img_small, rng, bias_type=bias_type)
     rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
 
     seeds = grid_seeds(w, h, n_seeds)
+    nr = np.hypot(w, h)
     # (N, M, 2)
     diff = seeds[:, None, :] - centers[None, :, :]
-    d = np.sqrt((diff ** 2).sum(axis=-1)) + np.sqrt(w * h) * 1e-2
+    d = np.sqrt((diff ** 2).sum(axis=-1)) + nr * 5e-3
     # d = np.maximum(d, 1e-12)
 
-    v = (diff / (d[..., None] ** 2)).sum(axis=1) * np.sqrt(w * h / len(centers)) * 5   # (N, 2)
+    v = (diff / (d[..., None] ** 2)).sum(axis=1) * nr / np.sqrt(len(centers)) * 5   # (N, 2)
     seeds += v
 
     def _voronoi_process(args):
