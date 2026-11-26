@@ -10,7 +10,7 @@ from PIL import Image, ImageFilter
 from inkex.units import convert_unit
 
 from image_helper import pil_quantize_indices, same_color_components, component_representative_points_dt, simple_saliency, thread_pool
-from geometry_helper import clip_polygon_halfplane, clip_polygon_halfplane_both, clip_polygon_rect, solve_linear_abc, voronoi_cell, simplify_poly, snap_points_to_rect,\
+from geometry_helper import clip_polygon_halfplane_both, clip_polygon_rect, solve_linear_abc, voronoi_cell, simplify_poly, snap_points_to_rect,\
     dedupe_points, ray_polygon_intersections, polygon_area, polygon_centroid
 
 
@@ -332,7 +332,7 @@ def _metro_score_grid(img_small, rng, gw, gh, bias_type):
     xs = (np.arange(gw + 1) * ww / gw).astype(np.int64); xs[-1] = ww
     sums = np.add.reduceat(np.add.reduceat(raw, ys[:-1], axis=0), xs[:-1], axis=1)
     counts = np.outer(np.diff(ys), np.diff(xs))
-    scores = sums / counts
+    scores = sums / np.maximum(counts, 1)
     # norm
     scores -= scores.min()
     scores /= scores.max() + 1e-12
@@ -505,6 +505,286 @@ def metro_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, m
     ]
     
     return polys
+
+
+# ---------- quad cut ----------
+def _tri_edges(tris):
+    """Yield (edge_key, tri_index, opposite_vertex) for every triangle edge."""
+    for ti, (a, b, c) in enumerate(tris):
+        yield (min(a, b), max(a, b)), ti, c
+        yield (min(b, c), max(b, c)), ti, a
+        yield (min(c, a), max(c, a)), ti, b
+
+
+def merge_triangles_to_quads(points, tris, max_angle_deg=35.0, max_aspect=3.0,
+                             absorb_leftovers=True):
+    """Pair adjacent triangles into quads, then absorb leftover triangles
+    into an adjacent quad (producing mostly quads, some pentagons) instead of
+    emitting them as standalone triangles.
+
+    points : (N,2) float array
+    tris   : list of (i,j,k) index triples
+    returns: list of polygons (each a list/array of 2D points)
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    n_tri = len(tris)
+    if n_tri == 0:
+        return []
+
+    # edge -> list of (tri_index, opposite_vertex)
+    edge_map = {}
+    for key, ti, opp in _tri_edges(tris):
+        edge_map.setdefault(key, []).append((ti, opp))
+    edge_map = {key: lst for key, lst in edge_map.items() if len(lst) == 2}
+
+    def _angle_at(p, q1, q2):
+        v1 = q1 - p
+        v2 = q2 - p
+        c = (v1 * v2).sum(axis=-1) / (np.linalg.norm(v1, axis=-1) * np.linalg.norm(v2, axis=-1) + 1e-12)
+        return np.degrees(np.acos(np.clip(c, -1.0, 1.0)))
+
+    def _quad_score(quad):
+        q = pts[quad]
+        if len(q.shape) > 2:
+            q = q.swapaxes(0, 1)
+        ang0 = _angle_at(q[1], q[0], q[2])
+        ang1 = _angle_at(q[3], q[0], q[2])
+        planarity = np.abs((ang0 + ang1) - 180.0)
+        d1 = np.linalg.norm(q[0] - q[2], axis=-1)
+        d2 = np.linalg.norm(q[1] - q[3], axis=-1)
+        aspect = np.maximum(d1, d2) / (np.minimum(d1, d2) + 1e-12)
+        return planarity, aspect, planarity + (aspect - 1.0) * 10.0
+
+    # ---- Pass 1: greedy triangle pairing into quads ----
+    quads = []
+    key = np.asarray(list(edge_map.keys()))
+    lst = np.asarray(list(edge_map.values()))
+    a, b = key[:,0], key[:,1]
+    o0, o1 = lst[:,0,1], lst[:,1,1]
+    quads = np.column_stack([a, o0, b, o1])
+    planarity, aspect, score = _quad_score(quads)
+    mask = (planarity < max_angle_deg) & (aspect < max_aspect)
+    quads = quads[mask]
+    score = score[mask]
+    key = key[mask]
+    lst = lst[mask]
+    order = np.argsort(score)
+    quads = quads[order]
+    score = score[order]
+    key = key[order]
+    lst = lst[order]
+
+    used = np.repeat(False, n_tri)
+    # polys: list of dicts {verts: [...], score: float, quads: bool}
+    polys = []
+
+    for k, l, s, quad in zip(key, lst, score, quads):
+        (t0, o0), (t1, o1) = l
+        if used[[t0, t1]].any():
+            continue
+        used[[t0, t1]] = True
+        pi = len(polys)
+        polys.append({"verts": quad, "score": s})
+
+    # ---- Pass 2: absorb leftover triangles into adjacent quads ----
+    if absorb_leftovers:
+        # Build vertex-index -> poly index for adjacency lookup on shared edges.
+        # For a leftover triangle, look at each of its 3 edges; the neighboring
+        # triangle on that edge is either (a) absorbed into a quad -> merge with it,
+        # or (b) another leftover triangle -> defer (can't merge two leftovers
+        # into a quad without producing a quad; we can pair them).
+        leftover_polys = []  # poly index for each leftover triangle
+        for ti in range(n_tri):
+            if not used[ti]:
+                leftover_polys.append(ti)
+
+        # Map (tri_index) -> poly index for already-formed quads
+        # (reuse tri_to_poly)
+        # Process leftovers: for each, find best-scoring adjacent quad via edges.
+        # Do it iteratively so that after absorbing, the poly's edge set updates.
+        # We maintain poly edge -> poly index.
+        def poly_edges(poly):
+            v = poly["verts"]
+            return [(min(v[k], v[(k+1) % len(v)]), max(v[k], v[(k+1) % len(v)]))
+                    for k in range(len(v))]
+
+        edge_to_poly = {}
+        for pi, poly in enumerate(polys):
+            for e in poly_edges(poly):
+                edge_to_poly[e] = pi
+
+        # Greedy: for each leftover triangle, try its 3 edges; if any edge
+        # touches an existing poly, merge with the one giving the best
+        # (smallest) quad score, i.e. the most "quad-like" neighbor.
+        absorbed = [False] * n_tri
+        for ti in leftover_polys:
+            if absorbed[ti]:
+                continue
+            a, b, c = tris[ti]
+            best = None  # (score, pi, shared_edge, tri_opposite_vertex)
+            for e, opp in [((min(a, b), max(a, b)), c),
+                         ((min(b, c), max(b, c)), a),
+                         ((min(c, a), max(c, a)), b)]:
+                pi = edge_to_poly.get(e, None)
+                if pi is None:
+                    continue
+                # The leftover triangle shares edge e with poly pi.
+                # Merge: walk poly verts, replace edge e with the detour
+                # e -> opposite vertex of the triangle.
+                # Opposite vertex = the tri vertex not in e.
+                merged = _merge_tri_into_poly(polys[pi]["verts"], e, opp)
+                if merged is None or len(merged) < 4:
+                    continue
+                s = _quad_score(merged)
+                if best is None or s < best[0]:
+                    best = (s, pi, e, opp, merged)
+            if best is None:
+                # No adjacent quad yet (neighbor also a leftover). Defer:
+                # pair with another leftover triangle if possible later.
+                continue
+            s, pi, e, opp, merged = best
+            # update poly
+            old_edges = poly_edges(polys[pi])
+            for oe in old_edges:
+                if edge_to_poly.get(oe, None) == pi:
+                    del edge_to_poly[oe]
+            polys[pi]["verts"] = merged
+            polys[pi]["score"] = s
+            for ne in poly_edges(polys[pi]):
+                edge_to_poly[ne] = pi
+            absorbed[ti] = True
+
+        # Any still-unabsorbed leftovers: pair them with each other into quads
+        # (two leftover triangles sharing an edge -> quad), or emit as triangles.
+        remaining = [ti for ti in leftover_polys if not absorbed[ti]]
+        if remaining:
+            # Build edge -> list of remaining tri indices
+            rem_edge_map = {}
+            for ti in remaining:
+                a, b, c = tris[ti]
+                for e, opp in (((min(a, b), max(a, b)), c),
+                               ((min(b, c), max(b, c)), a),
+                               ((min(c, a), max(c, a)), b)):
+                    rem_edge_map.setdefault(e, []).append((ti, opp))
+            rem_used = set()
+            for ti in remaining:
+                if ti in rem_used:
+                    continue
+                a, b, c = tris[ti]
+                best = None
+                for e, opp_ti in (((min(a, b), max(a, b)), c),
+                                  ((min(b, c), max(b, c)), a),
+                                  ((min(c, a), max(c, a)), b)):
+                    for (tj, opp_tj) in rem_edge_map.get(e, []):
+                        if tj == ti or tj in rem_used:
+                            continue
+                        # quad from two triangles sharing edge e
+                        ea, eb = e
+                        quad = [ea, opp_ti, eb, opp_tj]
+                        s = _quad_score(quad)
+                        if best is None or s < best[0]:
+                            best = (s, tj, quad)
+                if best is not None:
+                    s, tj, quad = best
+                    rem_used.add(ti); rem_used.add(tj)
+                    polys.append({"verts": quad, "score": s})
+                else:
+                    rem_used.add(ti)
+                    polys.append({"verts": [a, b, c], "score": 0.0})
+
+    else:
+        # original behavior: emit leftover triangles
+        for ti in range(n_tri):
+            if used[ti]:
+                continue
+            a, b, c = tris[ti]
+            polys.append({"verts": [a, b, c], "score": 0.0})
+
+    # ---- Convert to point lists ----
+    out = []
+    for poly in polys:
+        poly_pts = pts[poly["verts"]]
+        poly_pts = simplify_poly(poly_pts)
+        if len(poly_pts) >= 3:
+            out.append(poly_pts)
+    return out
+
+
+def _merge_tri_into_poly(poly_idx, shared_edge, tri_opp):
+    """Merge a triangle (sharing `shared_edge`) into a polygon.
+
+    poly_idx : list of vertex indices (counter-clockwise)
+    shared_edge : (u, v) index pair present as consecutive edge in poly_idx
+    tri_opp : the triangle's third vertex (not in shared_edge)
+
+    Returns new vertex list, or None if the edge is not found as a
+    consecutive pair (either orientation).
+    """
+    n = len(poly_idx)
+    poly_idx_next = np.roll(poly_idx, -1)
+    ks = np.where(((poly_idx == shared_edge[0]) & (poly_idx_next == shared_edge[1])) | ((poly_idx == shared_edge[1]) & (poly_idx_next == shared_edge[0])))[0]
+    if len(ks) > 0:
+        k = ks[0]
+        # Insert tri_opp between u and v (or v and u)
+        new = np.insert(poly_idx, k + 1, tri_opp)
+        # cancel nearby reversed edge
+        mask = new != np.roll(new, 2)
+        mask &= np.roll(mask, -1)
+        if not mask.all():
+            new = new[mask]
+        return new
+    return None
+
+def quad_cut_cells(w, h, pts, snap_ratio=0.6, boundary_spacing=None):
+    """Like triangle_cells, but Delaunay triangles are merged into quads."""
+    n_seeds = len(pts)
+    aspect = w / max(h, 1e-6)
+    nx = max(2, int(round(np.sqrt(n_seeds * aspect))))
+    ny = max(2, int(round(n_seeds / nx)))
+    if nx * ny < n_seeds:
+        ny = int(np.ceil(n_seeds / nx))
+
+    step_x = w / nx
+    step_y = h / ny
+
+    snap_dist = snap_ratio * min(step_x, step_y)
+    pts = snap_points_to_rect(pts, w, h, snap_dist)
+
+    if boundary_spacing is None:
+        boundary_spacing = min(step_x, step_y) * 0.9
+    bpts = _boundary_points(w, h, boundary_spacing)
+
+    if len(bpts) > 0 and len(pts) > 0:
+        min_sep = min(step_x, step_y) * 0.5
+        min_sep_sq = min_sep * min_sep
+        keep_mask = np.ones(len(bpts), dtype=bool)
+        chunk = 2048
+        for s in range(0, len(bpts), chunk):
+            e = min(s + chunk, len(bpts))
+            sub = bpts[s:e]
+            d2 = ((sub[:, None, :] - pts[None, :, :]) ** 2).sum(axis=2)
+            keep_mask[s:e] = d2.min(axis=1) >= min_sep_sq
+        bpts = bpts[keep_mask]
+
+    pts = np.vstack([pts, bpts])
+    pts = dedupe_points(pts, eps=1e-6)
+    pts = np.clip(pts, (0.0, 0.0), (w, h), out=pts)
+
+    tris = delaunay_triangulate(pts)
+
+    # Clip triangles to the rect *before* merging, so edge triangles that get
+    # cut still have valid geometry; merging uses index adjacency which is
+    # preserved by clipping only in position, not topology.
+    # (We merge on indices, then clip the resulting quads.)
+    quads = merge_triangles_to_quads(pts, tris)
+
+    cells = []
+    for poly in quads:
+        clipped = clip_polygon_rect(poly, w, h)
+        clipped = simplify_poly(clipped)
+        if len(clipped) >= 3:
+            cells.append(clipped)
+    return cells
 
 
 # ---------- knife cut ----------
@@ -1009,8 +1289,7 @@ def splinters_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seed
 
 def voronoi_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                          bias_type):
-    # Voronoi (original path)
-    seeds = manual_seeds if len(manual_seeds) > 0 else  generate_seeds(w, h, n_seeds, img_small, rng, bias_type=bias_type)          
+    seeds = manual_seeds if len(manual_seeds) > 0 else generate_seeds(w, h, n_seeds, img_small, rng, bias_type=bias_type)
     rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
 
     def _voronoi_process(args):
@@ -1032,6 +1311,38 @@ def voronoi_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds,
     polygons = [x for x in thread_pool.map(_voronoi_process, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
     return polygons
 
+def crystals_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                         bias_type):
+    centers = manual_seeds if len(manual_seeds) > 0 else generate_seeds(w, h, max(2, n_seeds // 100), img_small, rng, bias_type=bias_type)
+    rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
+
+    seeds = grid_seeds(w, h, n_seeds)
+    # (N, M, 2)
+    diff = seeds[:, None, :] - centers[None, :, :]
+    d = np.sqrt((diff ** 2).sum(axis=-1)) + np.sqrt(w * h) * 1e-2
+    # d = np.maximum(d, 1e-12)
+
+    v = (diff / (d[..., None] ** 2)).sum(axis=1) * np.sqrt(w * h / len(centers)) * 5   # (N, 2)
+    seeds += v
+
+    def _voronoi_process(args):
+        i, seeds, rect = args
+        poly = voronoi_cell(i, seeds, rect, None)
+        if poly is None or len(poly) < 3:
+            return
+        poly = simplify_poly(poly)
+        if len(poly) < 3:
+            return
+
+        lo = np.min(poly, axis=0)
+        hi = np.max(poly, axis=0)
+
+        if np.prod(hi - lo) < 4.0:
+            return
+        return poly
+
+    polygons = [x for x in thread_pool.map(_voronoi_process, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
+    return polygons
 
 # ---------- Triangle-based per-cell sampling ----------
 
@@ -1095,7 +1406,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         )
         pars.add_argument(
             "--cell_shape", type=str, default="voronoi",
-            choices=["voronoi", "triangles", "knife_cut", "metro", "flowers", "flowers_soft", "river", "flowers_in_river", "splinters"]
+            choices=["voronoi", "triangles", "quads", "knife_cut", "metro", "flowers", "flowers_soft", "river", "flowers_in_river", "splinters", "crystals"]
         )
         pars.add_argument("--n_colors", type=int, default=12)
         pars.add_argument("--n_seeds", type=int, default=600)
@@ -1196,6 +1507,9 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         if cell_shape == "triangles":
             seeds = manual_seeds if len(manual_seeds) > 0 else generate_seeds(w, h, n_seeds, img_small, rng, bias_type=self.options.bias_type)
             polygons = triangle_cells(w, h, seeds)
+        elif cell_shape == "quads":
+            seeds = manual_seeds if len(manual_seeds) > 0 else generate_seeds(w, h, n_seeds, img_small, rng, bias_type=self.options.bias_type)
+            polygons = quad_cut_cells(w, h, seeds)
         elif cell_shape == "knife_cut":
             polygons = knife_cut_cells(
                 img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
@@ -1229,12 +1543,17 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         elif cell_shape == "splinters":
             polygons = splinters_cut_cells(
                 img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
-                bias_type=self.options.bias_type, # warp_polygons=True
+                bias_type=self.options.bias_type
+            )
+        elif cell_shape == "crystals":
+            polygons = crystals_cut_cells(
+                img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                bias_type=self.options.bias_type
             )
         else:
             polygons = voronoi_cut_cells(
                 img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
-                bias_type=self.options.bias_type, # warp_polygons=True
+                bias_type=self.options.bias_type
             )
 
         if len(polygons) == 0:

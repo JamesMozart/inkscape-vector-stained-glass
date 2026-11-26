@@ -8,6 +8,7 @@
        gui-text="Cell shape:">
         <option value="voronoi">Voronoi (cracked glass)</option>
         <option value="triangles">Triangles (Delaunay)</option>
+        <option value="quads">Quads (merged Delaunay)</option>
         <option value="knife_cut">Knife cut (Slash Dimension)</option>
         <option value="metro">Metro</option>
         <option value="flowers">Flowers</option>
@@ -15,6 +16,7 @@
         <option value="river">River</option>
         <option value="flowers_in_river">Flowers in river</option>
         <option value="splinters">Splinters</option>
+        <option value="crystals">Crystals</option>
     </param>
     <param name="n_colors" type="int" min="4" max="32" gui-text="Palette colors">12</param>
     <param name="n_seeds" type="int" min="4" max="5000" gui-text="Number of seeds">600</param>
