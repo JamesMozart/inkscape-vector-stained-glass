@@ -18,6 +18,8 @@ fully editable.
 ![Example output](example_metro.png)
 **Splinters**
 ![Example output](example_splinters.png)
+**Crystals (faceted shards radiating from focal points)**
+![Example output](example_crystals.png)
 
 ## Features
 
@@ -37,6 +39,11 @@ fully editable.
   splits the polygon that currently contains it with a random-angle line
   passing through the seed, keeping both halves. Later seeds land in
   smaller shards, producing thin, angular splinter-like panes.
+  - `crystals` — "crystal / faceted glass" cut: a small number of
+  *attractor* centers are placed, then a
+  regular grid of seeds is pushed away from those centers. Voronoi on the displaced seeds
+  produces elongated, radially-stretched shards that look like
+  crystalline facets radiating from the attractors.
 - Optional seed biasing:
   - `none` — uniform Poisson-disk sampling
   - `edges` — seeds concentrated on strong image edges

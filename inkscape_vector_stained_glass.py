@@ -1289,7 +1289,7 @@ def splinters_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seed
 
 def voronoi_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                          bias_type):
-    seeds = manual_seeds if len(manual_seeds) > 0 else generate_seeds(w, h, n_seeds, img_small, rng, bias_type=bias_type)          
+    seeds = manual_seeds if len(manual_seeds) > 0 else generate_seeds(w, h, n_seeds, img_small, rng, bias_type=bias_type)
     rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
 
     def _voronoi_process(args):
@@ -1311,6 +1311,38 @@ def voronoi_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds,
     polygons = [x for x in thread_pool.map(_voronoi_process, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
     return polygons
 
+def crystals_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                         bias_type):
+    centers = manual_seeds if len(manual_seeds) > 0 else generate_seeds(w, h, max(2, n_seeds // 100), img_small, rng, bias_type=bias_type)
+    rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
+
+    seeds = grid_seeds(w, h, n_seeds)
+    # (N, M, 2)
+    diff = seeds[:, None, :] - centers[None, :, :]
+    d = np.sqrt((diff ** 2).sum(axis=-1)) + np.sqrt(w * h) * 1e-2
+    # d = np.maximum(d, 1e-12)
+
+    v = (diff / (d[..., None] ** 2)).sum(axis=1) * np.sqrt(w * h / len(centers)) * 5   # (N, 2)
+    seeds += v
+
+    def _voronoi_process(args):
+        i, seeds, rect = args
+        poly = voronoi_cell(i, seeds, rect, None)
+        if poly is None or len(poly) < 3:
+            return
+        poly = simplify_poly(poly)
+        if len(poly) < 3:
+            return
+
+        lo = np.min(poly, axis=0)
+        hi = np.max(poly, axis=0)
+
+        if np.prod(hi - lo) < 4.0:
+            return
+        return poly
+
+    polygons = [x for x in thread_pool.map(_voronoi_process, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
+    return polygons
 
 # ---------- Triangle-based per-cell sampling ----------
 
@@ -1374,7 +1406,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         )
         pars.add_argument(
             "--cell_shape", type=str, default="voronoi",
-            choices=["voronoi", "triangles", "quads", "knife_cut", "metro", "flowers", "flowers_soft", "river", "flowers_in_river", "splinters"]
+            choices=["voronoi", "triangles", "quads", "knife_cut", "metro", "flowers", "flowers_soft", "river", "flowers_in_river", "splinters", "crystals"]
         )
         pars.add_argument("--n_colors", type=int, default=12)
         pars.add_argument("--n_seeds", type=int, default=600)
@@ -1510,6 +1542,11 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
             )
         elif cell_shape == "splinters":
             polygons = splinters_cut_cells(
+                img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                bias_type=self.options.bias_type
+            )
+        elif cell_shape == "crystals":
+            polygons = crystals_cut_cells(
                 img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                 bias_type=self.options.bias_type
             )
