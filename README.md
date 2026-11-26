@@ -24,6 +24,8 @@ fully editable.
 - Varies cell shapes:
   - `voronoi` — organic polygonal cells from Poisson-disk / edge-weighted / brightness-weighted seeds
   - `triangles` — Delaunay-based triangular cells with snapped boundary points
+  - `quads` — Delaunay triangulation followed by pairing adjacent triangles into
+  quads
   - `knife_cut` — "Slash Dimension" style sparse perpendicular-bisector cuts between nearest same-color region centroids
   - `metro` — Metro-style rectangular tiles on an integer grid; tile sizes are modulated by image score (edges / brightness), filled greedily by area and hole-filled to cover the canvas
   - `flowers` — two-level radial Voronoi: first partition the image into
@@ -39,6 +41,8 @@ fully editable.
   - `none` — uniform Poisson-disk sampling
   - `edges` — seeds concentrated on strong image edges
   - `brightness` — seeds biased toward darker areas; also boosts dark regions during cell selection
+  - `saliency` — seeds concentrated on visually salient regions (high-contrast /
+    attention-grabbing areas)
 
 ## Requirements
 
@@ -68,7 +72,7 @@ Open **Extensions → Render → Vector Stained Glass**.
 
 | Option         | Type   | Default   | Description                                                                                     |
 | -------------- | ------ | --------- | ----------------------------------------------------------------------------------------------- |
-| `cell_shape`   | choice | `voronoi` | Cell shape: `voronoi` (organic polygons), `triangles` (Delaunay), `knife_cut` (sparse perpendicular-bisector cuts between nearest same-color region centroids), `metro` (Metro-style rectangular tiling), `flowers` (two-level radial Voronoi with petal-shaped seed rings), or `splinters` (sequential random-angle line cuts through seeds, like wood splinters). |
+| `cell_shape`   | choice | `voronoi` | see `Features` above |
 | `n_colors`     | int    | `12`      | Palette size for color quantization (4–32).                                                     |
 | `n_seeds`      | int    | `600`     | Number of cells (seeds / target triangles). Capped internally at `w*h/100`.                      |
 | `stroke_width` | float  | `2.0`     | Outline stroke width between cells (0.5–10).                                                    |
