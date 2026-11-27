@@ -1244,7 +1244,7 @@ def splinters_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seed
         inside = np.bitwise_xor.reduce(cross, axis=0)       # (H, W) bool
         return inside.any()
 
-    base_angles = np.linspace(0.0, rng.choice([-np.pi, np.pi]), max(len(seeds), 1), endpoint=False) + rng.uniform(0, 2 * np.pi)
+    base_angles = np.linspace(0.0, rng.choice([-np.pi, np.pi]) / 2 * len(seeds), max(len(seeds), 1), endpoint=False) + rng.uniform(0, 2 * np.pi)
 
     for k, seed in enumerate(seeds):
         # Find the cell containing this seed
@@ -1321,6 +1321,8 @@ def voronoi_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds,
         polygons.sort(key=lambda x: (x[2] - x[0]).prod(), reverse=True)
     return polygons
 
+
+# crystals cut
 def crystals_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                          bias_type):
     centers = manual_seeds if len(manual_seeds) > 0 else generate_seeds(w, h, n_seeds // 100 + 1, img_small, rng, bias_type=bias_type)
