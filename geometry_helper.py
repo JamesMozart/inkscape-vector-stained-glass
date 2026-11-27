@@ -135,24 +135,16 @@ def voronoi_cell(i, seeds, poly, neighbors_idx=None, eps=1e-9, n_cut_limit=None)
     current polygon, and process candidates nearest-first so the polygon
     shrinks early and later pruning is stronger.
     """
-    seedi = np.asarray(seeds[i], dtype=float)
+    seedi = seeds[i]
 
     # Candidate seeds
     if neighbors_idx is not None:
-        cand = np.asarray(neighbors_idx, dtype=np.int64)
-        # drop self if present, and dedupe
-        cand = cand[cand != i]
-        cand = np.unique(cand)
-        other = np.asarray(seeds, dtype=float)[cand]
+        other = seeds[neighbors_idx]
     else:
-        mask = np.ones(len(seeds), dtype=bool)
-        mask[i] = False
-        other = np.asarray(seeds, dtype=float)[mask]
+        other = np.delete(seeds, i, axis=0)
 
-    if len(other) == 0 or len(poly) < 3:
-        return None if len(poly) < 3 else poly
-
-    poly = np.asarray(poly, dtype=float)
+    if len(poly) < 3:
+        return None
 
     # Distance from seed_i to each other seed; process nearest first.
     d = np.hypot(other[:, 0] - seedi[0], other[:, 1] - seedi[1])
@@ -242,18 +234,13 @@ def snap_points_to_rect(pts, w, h, snap_dist):
 
 
 def dedupe_points(pts, eps=1e-6):
-    """Remove near-duplicate points (quantize to an eps grid, then check one by one)."""
+    """Remove near-duplicate points (quantize to an eps grid, then dedupe)."""
+    pts = np.asarray(pts)
     if len(pts) == 0:
         return pts
-    # Quantize to an eps grid, deduplicate via a dict, keep first occurrence
     keys = np.round(pts / eps).astype(np.int64)
-    seen = {}
-    keep = []
-    for i, k in enumerate(map(tuple, keys)):
-        if k not in seen:
-            seen[k] = i
-            keep.append(i)
-    return pts[np.array(keep, dtype=np.int64)]
+    _, first_idx = np.unique(keys, axis=0, return_index=True)
+    return pts[first_idx]
 
 
 def ray_polygon_intersections(origin, directions, poly, eps=1e-12):
