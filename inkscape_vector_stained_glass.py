@@ -1288,12 +1288,12 @@ def splinters_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seed
 # ---------- voronoi cut ----------
 
 def voronoi_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
-                         bias_type):
+                         bias_type, poly_to_rect=False):
     seeds = manual_seeds if len(manual_seeds) > 0 else generate_seeds(w, h, n_seeds, img_small, rng, bias_type=bias_type)
     rect = np.asarray([(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)])
 
     def _voronoi_process(args):
-        i, seeds, rect = args
+        i, seeds, rect, poly_to_rect = args
         poly = voronoi_cell(i, seeds, rect, None)
         if poly is None or len(poly) < 3:
             return
@@ -1306,9 +1306,19 @@ def voronoi_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds,
 
         if np.prod(hi - lo) < 4.0:
             return
+
+        if poly_to_rect:
+            poly = np.asarray([
+                lo,
+                (lo[0], hi[1]),
+                hi,
+                (hi[0], lo[1]),
+            ])
         return poly
 
-    polygons = [x for x in thread_pool.map(_voronoi_process, [(i, seeds, rect) for i in range(len(seeds))]) if x is not None]
+    polygons = [x for x in thread_pool.map(_voronoi_process, [(i, seeds, rect, poly_to_rect) for i in range(len(seeds))]) if x is not None]
+    if poly_to_rect:
+        polygons.sort(key=lambda x: (x[2] - x[0]).prod(), reverse=True)
     return polygons
 
 def crystals_cut_cells(img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
@@ -1354,16 +1364,13 @@ def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
     test on a per-polygon bounding box. For a few hundred cells this is fine.
     """
     def _process(args):
-        pal_indices, poly = args
-        h_img, w_img = pal_indices.shape
-        xs = poly[:,0]
-        ys = poly[:,1]
-        x0 = max(0, int(np.floor(np.min(xs))))
-        x1 = min(w_img, int(np.ceil(np.max(xs))) + 1)
-        y0 = max(0, int(np.floor(np.min(ys))))
-        y1 = min(h_img, int(np.ceil(np.max(ys))) + 1)
-        if x1 <= x0 or y1 <= y0:
+        pal_indices, poly, w, h = args
+        lo = np.maximum(np.floor(np.min(poly, axis=0)), (0, 0)).astype(np.int32)
+        hi = np.minimum(np.ceil(np.max(poly, axis=0)), (w, h)).astype(np.int32)
+        if np.prod(hi - lo) <= 0:
             return 0
+        x0, y0 = lo
+        x1, y1 = hi
         # Pixel centers in bbox
         gx, gy = np.meshgrid(np.arange(x0, x1) + 0.5, np.arange(y0, y1) + 0.5)
         # Edge endpoints, closed loop
@@ -1385,16 +1392,13 @@ def dominant_palette_index_for_polygons(polygons, pal_indices, n_palette, w, h):
         inside = np.bitwise_xor.reduce(cross, axis=0)       # (H, W) bool
         if not inside.any():
             return 0
-        idx = np.where(inside.ravel())[0]
         # Map flat local index back to global pixel index
-        local_y, local_x = np.divmod(idx, (x1 - x0))
-        glob_y = local_y + y0
-        glob_x = local_x + x0
-        vals = pal_indices[glob_y, glob_x]
+        local_y, local_x = np.nonzero(inside)
+        vals = pal_indices[local_y + y0, local_x + x0]
         counts = np.bincount(vals, minlength=n_palette)
-        return int(np.argmax(counts))
+        return np.argmax(counts)
 
-    results = list(thread_pool.map(_process, [(pal_indices, poly) for poly in polygons]))
+    results = list(thread_pool.map(_process, [(pal_indices, poly, w, h) for poly in polygons]))
     return np.array(results, dtype=np.int32)
 
 # ---------- Inkscape extension ----------
@@ -1407,7 +1411,7 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
         )
         pars.add_argument(
             "--cell_shape", type=str, default="voronoi",
-            choices=["voronoi", "triangles", "quads", "knife_cut", "metro", "flowers", "flowers_soft", "river", "flowers_in_river", "splinters", "crystals"]
+            choices=["voronoi", "triangles", "quads", "knife_cut", "metro", "flowers", "flowers_soft", "river", "flowers_in_river", "splinters", "crystals", "poster_wall"]
         )
         pars.add_argument("--n_colors", type=int, default=12)
         pars.add_argument("--n_seeds", type=int, default=600)
@@ -1550,6 +1554,11 @@ class VectorStainedGlassExtension(inkex.EffectExtension):
             polygons = crystals_cut_cells(
                 img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
                 bias_type=self.options.bias_type
+            )
+        elif cell_shape == "poster_wall":
+            polygons = voronoi_cut_cells(
+                img_small, pal_indices, n_palette, palette, w, h, n_seeds, manual_seeds, rng,
+                bias_type=self.options.bias_type, poly_to_rect=True
             )
         else:
             polygons = voronoi_cut_cells(
