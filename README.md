@@ -20,6 +20,8 @@ fully editable.
 ![Example output](example_splinters.png)
 **Crystals (faceted shards radiating from focal points)**
 ![Example output](example_crystals.png)
+**Poster wall**
+![Example output](example_poster_wall.png)
 
 ## Features
 
@@ -44,6 +46,11 @@ fully editable.
   regular grid of seeds is pushed away from those centers. Voronoi on the displaced seeds
   produces elongated, radially-stretched shards that look like
   crystalline facets radiating from the attractors.
+  - `poster_wall` — "poster wall / tiled collage" cut: Voronoi cells are
+  each replaced by their axis-aligned bounding box (a rectangle), so the
+  canvas is filled with stacked rectangular
+  "posters" of varying sizes and aspect ratios, like pasted flyers on a
+  wall.
 - Optional seed biasing:
   - `none` — uniform Poisson-disk sampling
   - `edges` — seeds concentrated on strong image edges

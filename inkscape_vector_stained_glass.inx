@@ -17,6 +17,7 @@
         <option value="flowers_in_river">Flowers in river</option>
         <option value="splinters">Splinters</option>
         <option value="crystals">Crystals</option>
+        <option value="poster_wall">Poster wall</option>
     </param>
     <param name="n_colors" type="int" min="4" max="32" gui-text="Palette colors">12</param>
     <param name="n_seeds" type="int" min="4" max="5000" gui-text="Number of seeds">600</param>
