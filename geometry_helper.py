@@ -13,12 +13,10 @@ def clip_polygon_halfplane(poly, a, b, c):
     dist = poly @ ab + c
     inside = dist <= 1e-9
     # skip fully inside or outside
-    inside_size = inside.sum()
-    if inside_size == n:
+    if inside.all():
         return poly
-    elif inside_size == 0:
+    elif not inside.any():
         return np.empty((0, 2), dtype=float)
-    prev_inside = np.roll(inside, 1)
 
     def intersect(p1, p2):
         d1 = p1 @ ab + c
@@ -31,14 +29,11 @@ def clip_polygon_halfplane(poly, a, b, c):
 
     out = []
     prev = poly[-1]
-    for i in range(n):
-        cur = poly[i]
-        if inside[i]:
-            if not prev_inside[i]:
-                out.append(intersect(prev, cur))
-            out.append(cur)
-        elif prev_inside[i]:
+    for cur, is_inside, is_intersect in zip(poly, inside, inside ^ np.roll(inside, 1)):
+        if is_intersect:
             out.append(intersect(prev, cur))
+        if is_inside:
+            out.append(cur)
         prev = cur
     return np.asarray(out, dtype=float) if out else np.empty((0, 2), dtype=float)
 
@@ -57,39 +52,31 @@ def clip_polygon_halfplane_both(poly, a, b, c, eps=1e-9):
     """
     poly = np.asarray(poly, dtype=float)
     n = len(poly)
-    empty = np.empty((0, 2), dtype=float)
     if n == 0:
-        return empty, empty
+        return np.empty((0, 2), dtype=float), np.empty((0, 2), dtype=float)
 
     ab = np.array([a, b], dtype=float)
     dist = poly @ ab + c                     # (N,)
     inside_lo = dist <= eps                  # <= 0 side
     inside_hi = dist >= -eps                 # >= 0 side
 
-    lo_size = inside_lo.sum()
-    hi_size = inside_hi.sum()
-
     # Fully on one side: one side is the whole polygon, the other empty.
-    if lo_size == n:
-        return poly, empty
-    if hi_size == n:
-        return empty, poly
+    if inside_lo.all():
+        return poly, np.empty((0, 2), dtype=float)
+    if inside_hi.all():
+        return np.empty((0, 2), dtype=float), poly
 
     def _clip(mask):
         """Sutherland-Hodgman using a precomputed inside mask."""
-        prev_mask = np.roll(mask, 1)
         out = []
         prev = poly[-1]
-        for i in range(n):
-            cur = poly[i]
-            if mask[i]:
-                if not prev_mask[i]:
-                    out.append(_intersect(prev, cur, dist))
-                out.append(cur)
-            elif prev_mask[i]:
+        for cur, is_inside, is_intersect in zip(poly, mask, mask ^ np.roll(mask, 1)):
+            if is_intersect:
                 out.append(_intersect(prev, cur, dist))
+            if is_inside:
+                out.append(cur)
             prev = cur
-        return np.asarray(out, dtype=float) if out else empty
+        return np.asarray(out, dtype=float) if out else np.empty((0, 2), dtype=float)
 
     def _intersect(p1, p2, d):
         # d holds distances for the whole polygon; recompute per-edge is cheap
